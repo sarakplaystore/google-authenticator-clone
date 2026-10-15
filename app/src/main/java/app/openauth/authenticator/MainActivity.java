@@ -44,6 +44,7 @@ import java.util.Locale;
 /** Main screen: a local, offline-first TOTP authenticator. */
 public final class MainActivity extends Activity {
   private static final int REQUEST_SCAN = 41;
+  private static final int REQUEST_FACE = 61;
   private static final int COLOR_BACKGROUND = Color.rgb(248, 249, 250);
   private static final int COLOR_SURFACE = Color.WHITE;
   private static final int COLOR_TEXT = Color.rgb(32, 33, 36);
@@ -54,11 +55,19 @@ public final class MainActivity extends Activity {
   private final Handler handler = new Handler();
   private final List<AccountCard> visibleCards = new ArrayList<AccountCard>();
   private AccountStore store;
+  private FaceStore faceStore;
   private ArrayList<Account> accounts = new ArrayList<Account>();
   private LinearLayout accountList;
   private EditText searchField;
   private String searchQuery = "";
   private boolean searchVisible;
+  private FrameLayout rootView;
+  private View lockOverlay;
+  private TextView lockMessage;
+  private boolean locked;
+  private boolean faceCheckRunning;
+  private long backgroundedAt;
+  private String pendingUri;
 
   private final Runnable clockTick = new Runnable() {
     @Override public void run() {
@@ -74,6 +83,7 @@ public final class MainActivity extends Activity {
     super.onCreate(state);
     configureSystemBars();
     store = new AccountStore(this);
+    faceStore = new FaceStore(this);
     try {
       accounts = new ArrayList<Account>(store.load());
     } catch (RuntimeException e) {
@@ -81,32 +91,151 @@ public final class MainActivity extends Activity {
     }
     setContentView(buildScreen());
     renderAccounts();
-    handleIncomingIntent(getIntent());
+    if (faceStore.isEnabled()) {
+      pendingUri = uriFromIntent(getIntent());
+      lockApp();
+    } else {
+      handleIncomingIntent(getIntent());
+    }
   }
 
   @Override protected void onResume() {
     super.onResume();
     handler.removeCallbacks(clockTick);
     handler.post(clockTick);
+    if (faceStore != null && faceStore.isEnabled() && !locked && backgroundedAt > 0) {
+      long grace = faceStore.getGraceSeconds() * 1000L;
+      if (System.currentTimeMillis() - backgroundedAt > grace) {
+        lockApp();
+      }
+    }
   }
 
   @Override protected void onPause() {
     handler.removeCallbacks(clockTick);
+    backgroundedAt = System.currentTimeMillis();
     super.onPause();
   }
 
   @Override protected void onNewIntent(Intent intent) {
     super.onNewIntent(intent);
     setIntent(intent);
-    handleIncomingIntent(intent);
+    if (locked) {
+      pendingUri = uriFromIntent(intent);
+    } else {
+      handleIncomingIntent(intent);
+    }
   }
 
   @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
     super.onActivityResult(requestCode, resultCode, data);
+    if (requestCode == REQUEST_FACE) {
+      faceCheckRunning = false;
+      boolean disabled = data != null && data.getBooleanExtra(FaceActivity.EXTRA_LOCK_DISABLED, false);
+      if (resultCode == RESULT_OK || disabled) {
+        unlockApp();
+      } else if (locked) {
+        setLockMessage("The app is still locked. Look at the camera to open it.");
+      }
+      return;
+    }
     if (requestCode == REQUEST_SCAN && resultCode == RESULT_OK && data != null) {
       String value = data.getStringExtra(ScanActivity.EXTRA_RESULT);
       importOtpUri(value);
     }
+  }
+
+  /** Hides the codes behind the lock screen and asks for a face. */
+  private void lockApp() {
+    locked = true;
+    getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+    showLockOverlay();
+    setLockMessage("Your face is needed before the codes are shown");
+    startFaceCheck();
+  }
+
+  /** Starts the face check, unless one is already running. */
+  private void startFaceCheck() {
+    if (faceCheckRunning || isFinishing()) return;
+    faceCheckRunning = true;
+    Intent intent = new Intent(this, FaceActivity.class);
+    intent.putExtra(FaceActivity.EXTRA_MODE, FaceActivity.MODE_VERIFY);
+    try {
+      startActivityForResult(intent, REQUEST_FACE);
+    } catch (RuntimeException e) {
+      faceCheckRunning = false;
+      setLockMessage("The camera could not be opened.");
+    }
+  }
+
+  /** Shows the codes again after a successful face check. */
+  private void unlockApp() {
+    locked = false;
+    backgroundedAt = System.currentTimeMillis();
+    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+    hideLockOverlay();
+    if (pendingUri != null) {
+      String uri = pendingUri;
+      pendingUri = null;
+      importOtpUri(uri);
+    }
+  }
+
+  private void showLockOverlay() {
+    if (lockOverlay != null || rootView == null) return;
+    FrameLayout overlay = new FrameLayout(this);
+    overlay.setBackgroundColor(COLOR_BACKGROUND);
+    LinearLayout box = new LinearLayout(this);
+    box.setOrientation(LinearLayout.VERTICAL);
+    box.setGravity(Gravity.CENTER);
+    box.setPadding(dp(24), dp(24), dp(24), dp(24));
+
+    LockMark mark = new LockMark(this);
+    LinearLayout.LayoutParams markParams = new LinearLayout.LayoutParams(dp(76), dp(76));
+    markParams.bottomMargin = dp(18);
+    box.addView(mark, markParams);
+
+    TextView title = text("Authenticator is locked", 20, COLOR_TEXT, Typeface.BOLD);
+    title.setGravity(Gravity.CENTER);
+    box.addView(title);
+    lockMessage = text("Your face is needed before the codes are shown", 14,
+        COLOR_SECONDARY, Typeface.NORMAL);
+    lockMessage.setGravity(Gravity.CENTER);
+    lockMessage.setLineSpacing(dp(3), 1f);
+    LinearLayout.LayoutParams messageParams = new LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+    messageParams.topMargin = dp(10);
+    box.addView(lockMessage, messageParams);
+
+    TextView unlock = text("Unlock with your face", 15, Color.WHITE, Typeface.BOLD);
+    unlock.setGravity(Gravity.CENTER);
+    unlock.setPadding(dp(18), dp(13), dp(18), dp(13));
+    unlock.setBackground(roundDrawable(COLOR_PRIMARY, dp(26)));
+    unlock.setClickable(true);
+    unlock.setFocusable(true);
+    unlock.setOnClickListener(new View.OnClickListener() {
+      @Override public void onClick(View view) { startFaceCheck(); }
+    });
+    LinearLayout.LayoutParams unlockParams = new LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+    unlockParams.topMargin = dp(22);
+    box.addView(unlock, unlockParams);
+    overlay.addView(box, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+    rootView.addView(overlay, new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    lockOverlay = overlay;
+  }
+
+  private void hideLockOverlay() {
+    if (lockOverlay == null || rootView == null) return;
+    rootView.removeView(lockOverlay);
+    lockOverlay = null;
+    lockMessage = null;
+  }
+
+  private void setLockMessage(String message) {
+    if (lockMessage != null) lockMessage.setText(message);
   }
 
   private void configureSystemBars() {
@@ -123,6 +252,7 @@ public final class MainActivity extends Activity {
 
   private View buildScreen() {
     FrameLayout root = new FrameLayout(this);
+    rootView = root;
     root.setBackgroundColor(COLOR_BACKGROUND);
     root.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
       @Override public WindowInsets onApplyWindowInsets(View view, WindowInsets insets) {
@@ -252,15 +382,20 @@ public final class MainActivity extends Activity {
 
   private void showMainMenu(View anchor) {
     PopupMenu popup = new PopupMenu(this, anchor);
-    popup.getMenu().add(Menu.NONE, 1, 0, "About");
-    popup.getMenu().add(Menu.NONE, 2, 1, "How codes work");
+    popup.getMenu().add(Menu.NONE, 1, 0, "Settings");
+    popup.getMenu().add(Menu.NONE, 2, 1, "About");
+    popup.getMenu().add(Menu.NONE, 3, 2, "How codes work");
     popup.setOnMenuItemClickListener(new PopupMenu.OnMenuItemClickListener() {
       @Override public boolean onMenuItemClick(MenuItem item) {
         if (item.getItemId() == 1) {
-          showAbout();
+          openSettings();
           return true;
         }
         if (item.getItemId() == 2) {
+          showAbout();
+          return true;
+        }
+        if (item.getItemId() == 3) {
           showHowItWorks();
           return true;
         }
@@ -270,11 +405,20 @@ public final class MainActivity extends Activity {
     popup.show();
   }
 
+  private void openSettings() {
+    try {
+      startActivity(new Intent(this, SettingsActivity.class));
+    } catch (RuntimeException e) {
+      Toast.makeText(this, "The settings could not be opened", Toast.LENGTH_SHORT).show();
+    }
+  }
+
   private void showAbout() {
     new AlertDialog.Builder(this)
         .setTitle("About Authenticator")
         .setMessage("An independent, offline-first authenticator for standard TOTP accounts. "
             + "Your setup keys are encrypted on this device with the Android Keystore. "
+            + "The codes can be protected with a face unlock that is checked on this device. "
             + "This app is not affiliated with Google.")
         .setPositiveButton("Done", null)
         .show();
@@ -691,10 +835,16 @@ public final class MainActivity extends Activity {
   }
 
   private void handleIncomingIntent(Intent intent) {
+    String uri = uriFromIntent(intent);
+    if (uri == null) return;
+    importOtpUri(uri);
+  }
+
+  private String uriFromIntent(Intent intent) {
     if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction()) || intent.getData() == null) {
-      return;
+      return null;
     }
-    importOtpUri(intent.getData().toString());
+    return intent.getData().toString();
   }
 
   private TextView text(String value, float sp, int color, int style) {
@@ -760,6 +910,36 @@ public final class MainActivity extends Activity {
       Paint.FontMetrics metrics = textPaint.getFontMetrics();
       float baseline = cy - (metrics.ascent + metrics.descent) / 2f;
       canvas.drawText(String.valueOf(seconds), cx, baseline, textPaint);
+    }
+  }
+
+  /** A padlock drawn for the lock screen. */
+  private final class LockMark extends View {
+    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+    LockMark(Context context) { super(context); }
+
+    @Override protected void onDraw(Canvas canvas) {
+      super.onDraw(canvas);
+      float cx = getWidth() / 2f;
+      float r = Math.min(getWidth(), getHeight()) * 0.46f;
+      paint.setStyle(Paint.Style.FILL);
+      paint.setColor(0xFFE8F0FE);
+      canvas.drawCircle(cx, getHeight() / 2f, r, paint);
+      float bodyLeft = cx - r * 0.46f;
+      float bodyRight = cx + r * 0.46f;
+      float bodyTop = getHeight() / 2f - r * 0.05f;
+      float bodyBottom = getHeight() / 2f + r * 0.62f;
+      paint.setColor(COLOR_PRIMARY);
+      canvas.drawRoundRect(new RectF(bodyLeft, bodyTop, bodyRight, bodyBottom), r * 0.14f,
+          r * 0.14f, paint);
+      paint.setStyle(Paint.Style.STROKE);
+      paint.setStrokeWidth(r * 0.16f);
+      RectF shackle = new RectF(cx - r * 0.28f, getHeight() / 2f - r * 0.58f,
+          cx + r * 0.28f, getHeight() / 2f + r * 0.1f);
+      canvas.drawArc(shackle, 180, 180, false, paint);
+      paint.setStyle(Paint.Style.FILL);
+      canvas.drawCircle(cx, getHeight() / 2f + r * 0.22f, r * 0.12f, paint);
     }
   }
 

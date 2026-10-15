@@ -72,10 +72,20 @@ else
   fail "Java compiler not found. Install a JDK or set JAVAC/JAVAC_JAR."
 fi
 
+DEX_COMPILER="d8"
+DX_JAR_RESOLVED=""
+if [[ -n "${DX_JAR:-}" ]]; then
+  DX_JAR_RESOLVED="$DX_JAR"
+elif [[ -z "${D8_JAR:-}" && -z "${D8:-}" ]]; then
+  DX_JAR_RESOLVED="$(find_build_file lib/dx.jar || true)"
+fi
+
 if [[ -n "${D8_JAR:-}" ]]; then
   D8_CMD=("$JAVA_BIN" -Xmx2g -cp "$D8_JAR" com.android.tools.r8.D8)
 elif [[ -n "${D8:-}" ]]; then
   D8_CMD=("$D8")
+elif [[ -n "$DX_JAR_RESOLVED" ]]; then
+  DEX_COMPILER="dx"
 else
   D8_PATH="$(find_build_tool d8 || command -v d8 || true)"
   [[ -n "$D8_PATH" ]] || fail "D8 not found. Set D8_JAR or D8 to the Android dex compiler."
@@ -136,9 +146,15 @@ printf 'Compiling %s Java source files...\n' "${#SOURCES[@]}"
   zip -q -r "$BUILD_DIR/classes.jar" .
 )
 D8_ANDROID_JAR="${D8_ANDROID_JAR:-$ANDROID_JAR}"
-"${D8_CMD[@]}" --release --min-api 23 --lib "$D8_ANDROID_JAR" \
-  --output "$BUILD_DIR/dex" "$BUILD_DIR/classes.jar"
-[[ -f "$BUILD_DIR/dex/classes.dex" ]] || fail "D8 did not produce classes.dex."
+if [[ "$DEX_COMPILER" == "dx" ]]; then
+  # Older build-tools ship dx instead of D8; it reads the same class files.
+  "$JAVA_BIN" -Xmx2g -cp "$DX_JAR_RESOLVED" com.android.dx.command.Main --dex \
+    --min-sdk-version 23 --output "$BUILD_DIR/dex/classes.dex" "$BUILD_DIR/classes.jar"
+else
+  "${D8_CMD[@]}" --release --min-api 23 --lib "$D8_ANDROID_JAR" \
+    --output "$BUILD_DIR/dex" "$BUILD_DIR/classes.jar"
+fi
+[[ -f "$BUILD_DIR/dex/classes.dex" ]] || fail "The dex compiler did not produce classes.dex."
 
 cp "$BUILD_DIR/base.apk" "$BUILD_DIR/unsigned.apk"
 (
