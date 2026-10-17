@@ -39,6 +39,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 
@@ -46,6 +47,9 @@ import java.util.Locale;
 public final class MainActivity extends Activity {
   private static final int REQUEST_SCAN = 41;
   private static final int REQUEST_FACE = 42;
+  private static final int REQUEST_REVEAL = 43;
+  /** How long a code stays visible after a successful face check. */
+  private static final long REVEAL_WINDOW_MS = 30000L;
   private static final String STATE_PENDING_OTP = "pending_otp_uri";
   private static final int COLOR_BACKGROUND = Color.rgb(248, 249, 250);
   private static final int COLOR_SURFACE = Color.WHITE;
@@ -56,6 +60,8 @@ public final class MainActivity extends Activity {
 
   private final Handler handler = new Handler();
   private final List<AccountCard> visibleCards = new ArrayList<AccountCard>();
+  /** Account id -> wall-clock time at which the revealed code locks again. */
+  private final HashMap<String, Long> revealUntil = new HashMap<String, Long>();
   private AccountStore store;
   private FaceStore faceStore;
   private ArrayList<Account> accounts = new ArrayList<Account>();
@@ -67,9 +73,11 @@ public final class MainActivity extends Activity {
   private boolean searchVisible;
   private boolean accountsLoaded;
   private boolean facePromptActive;
+  private boolean revealRequestActive;
   private boolean autoPromptShown;
   private boolean suppressAccountRender;
   private String pendingOtpUri;
+  private String pendingRevealAccountId;
 
   private final Runnable clockTick = new Runnable() {
     @Override public void run() {
@@ -107,6 +115,8 @@ public final class MainActivity extends Activity {
     // A result callback normally clears this, but the system can destroy the
     // face screen without one (for example when a VIEW intent takes over).
     facePromptActive = false;
+    revealRequestActive = false;
+    pendingRevealAccountId = null;
     if (FaceGate.promptOnNextResume) {
       FaceGate.promptOnNextResume = false;
       autoPromptShown = false;
@@ -123,6 +133,9 @@ public final class MainActivity extends Activity {
 
   @Override protected void onPause() {
     handler.removeCallbacks(clockTick);
+    // Never leave a revealed code on screen behind another app, the recents
+    // preview, or after the screen turns off.
+    hideAllReveals();
     if (FaceGate.unlocked) {
       renderLockedState();
     }
@@ -136,6 +149,7 @@ public final class MainActivity extends Activity {
       autoPromptShown = false;
       accountsLoaded = false;
       accounts.clear();
+      hideAllReveals();
       renderLockedState();
     }
   }
@@ -148,6 +162,20 @@ public final class MainActivity extends Activity {
 
   @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
     super.onActivityResult(requestCode, resultCode, data);
+    if (requestCode == REQUEST_REVEAL) {
+      String accountId = pendingRevealAccountId;
+      pendingRevealAccountId = null;
+      revealRequestActive = false;
+      FaceGate.internalNavigation = false;
+      if (resultCode == RESULT_OK && FaceGate.unlocked && accountId != null) {
+        revealUntil.put(accountId, System.currentTimeMillis() + REVEAL_WINDOW_MS);
+        Toast.makeText(this, "Code revealed for 30 seconds", Toast.LENGTH_SHORT).show();
+      } else if (resultCode != RESULT_OK) {
+        Toast.makeText(this, "Face check canceled — code stays hidden", Toast.LENGTH_SHORT).show();
+      }
+      showUnlockedUi();
+      return;
+    }
     if (requestCode == REQUEST_FACE) {
       facePromptActive = false;
       FaceGate.internalNavigation = false;
@@ -276,7 +304,8 @@ public final class MainActivity extends Activity {
     box.addView(title);
 
     TextView description = text(enrolled
-            ? "Use your face to show your verification codes. Face data never leaves this device."
+            ? "Use your face to unlock the app. Every code reveal needs its own face check. "
+                + "Face data never leaves this device."
             : "Face registration is required before your codes can be shown. "
                 + "Three camera samples are stored on this device.",
         15, COLOR_SECONDARY, Typeface.NORMAL);
@@ -687,6 +716,7 @@ public final class MainActivity extends Activity {
     autoPromptShown = true;
     accountsLoaded = false;
     accounts.clear();
+    hideAllReveals();
     renderLockedState();
     startFacePrompt(!faceStore.isEnrolled());
   }
@@ -705,7 +735,9 @@ public final class MainActivity extends Activity {
     new AlertDialog.Builder(this)
         .setTitle("About verification codes")
         .setMessage("Codes are generated on this device from your setup key and the current time. "
-            + "They refresh automatically, even when you are offline. If a code is rejected, "
+            + "They refresh automatically, even when you are offline. "
+            + "Your codes stay masked until you tap the locked eye icon and pass a face check; "
+            + "they hide again after 30 seconds or when you leave the app. If a code is rejected, "
             + "check that your device date and time are set automatically.")
         .setPositiveButton("Got it", null)
         .show();
@@ -801,6 +833,9 @@ public final class MainActivity extends Activity {
     final LinearLayout view;
     final TextView codeText;
     final CountdownView countdown;
+    final EyeIconView eye;
+    final TextView hint;
+    boolean revealed;
     long lastStep = Long.MIN_VALUE;
 
     AccountCard(final Account account) {
@@ -818,7 +853,15 @@ public final class MainActivity extends Activity {
       view.setClickable(true);
       view.setFocusable(true);
       view.setOnClickListener(new View.OnClickListener() {
-        @Override public void onClick(View v) { copyCode(AccountCard.this); }
+        @Override public void onClick(View v) {
+          // Copying would put the digits on the clipboard where they could be
+          // read, so a locked code asks for a face check first.
+          if (MainActivity.this.isRevealed(account.getId(), System.currentTimeMillis())) {
+            copyCode(AccountCard.this);
+          } else {
+            requestReveal(account);
+          }
+        }
       });
 
       LinearLayout top = new LinearLayout(MainActivity.this);
@@ -850,6 +893,20 @@ public final class MainActivity extends Activity {
       codeText.setLetterSpacing(0.045f);
       codeRow.addView(codeText, new LinearLayout.LayoutParams(0,
           ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+      eye = new EyeIconView(MainActivity.this);
+      LinearLayout.LayoutParams eyeParams = new LinearLayout.LayoutParams(dp(44), dp(44));
+      eyeParams.rightMargin = dp(2);
+      codeRow.addView(eye, eyeParams);
+      eye.setOnClickListener(new View.OnClickListener() {
+        @Override public void onClick(View v) {
+          if (MainActivity.this.isRevealed(account.getId(), System.currentTimeMillis())) {
+            revealUntil.remove(account.getId());
+            update(System.currentTimeMillis());
+          } else {
+            requestReveal(account);
+          }
+        }
+      });
       countdown = new CountdownView(MainActivity.this, account.getPeriod());
       codeRow.addView(countdown, new LinearLayout.LayoutParams(dp(48), dp(48)));
       LinearLayout.LayoutParams codeRowParams = new LinearLayout.LayoutParams(
@@ -864,25 +921,60 @@ public final class MainActivity extends Activity {
       dividerParams.topMargin = dp(9);
       dividerParams.bottomMargin = dp(8);
       view.addView(divider, dividerParams);
-      TextView hint = text("Tap to copy code", 12, COLOR_SECONDARY, Typeface.NORMAL);
+      hint = text("", 12, COLOR_SECONDARY, Typeface.NORMAL);
       view.addView(hint);
     }
 
     void update(long now) {
       long step = now / (account.getPeriod() * 1000L);
-      if (step != lastStep) {
+      boolean nowRevealed = MainActivity.this.isRevealed(account.getId(), now);
+      if (step != lastStep || nowRevealed != revealed) {
         lastStep = step;
-        try {
-          String code = Totp.code(account, now);
-          int split = code.length() / 2;
-          codeText.setText(code.substring(0, split) + " " + code.substring(split));
-          codeText.setContentDescription(code);
-        } catch (RuntimeException e) {
-          codeText.setText("------");
-        }
+        revealed = nowRevealed;
+        applyRevealedState();
+        refreshCode(now);
       }
       countdown.update(now);
     }
+
+    private void refreshCode(long now) {
+      try {
+        String code = Totp.code(account, now);
+        if (revealed) {
+          int split = code.length() / 2;
+          codeText.setText(code.substring(0, split) + " " + code.substring(split));
+          codeText.setContentDescription(code);
+        } else {
+          codeText.setText(maskedCode(code.length()));
+          codeText.setContentDescription(
+              "Code hidden. Tap the eye to reveal it with a face check.");
+        }
+      } catch (RuntimeException e) {
+        codeText.setText("------");
+      }
+    }
+
+    private void applyRevealedState() {
+      eye.setRevealed(revealed);
+      if (revealed) {
+        eye.setContentDescription("Hide code");
+        hint.setText("Tap to copy code · locks automatically");
+      } else {
+        eye.setContentDescription("Locked. Tap to reveal code with a face check.");
+        hint.setText("Locked · tap the eye for a face check");
+      }
+    }
+  }
+
+  /** Bullets keep the number of digits visible without exposing the code. */
+  private String maskedCode(int length) {
+    int split = length / 2;
+    StringBuilder masked = new StringBuilder();
+    for (int i = 0; i < length; i++) {
+      if (i == split) masked.append(' ');
+      masked.append('\u2022');
+    }
+    return masked.toString();
   }
 
   private void copyCode(AccountCard card) {
@@ -894,6 +986,40 @@ public final class MainActivity extends Activity {
     } catch (RuntimeException e) {
       Toast.makeText(this, "This code could not be generated", Toast.LENGTH_SHORT).show();
     }
+  }
+
+  /**
+   * Hides every code. A fresh face check is needed before any code can be
+   * shown or copied again.
+   */
+  private void hideAllReveals() {
+    revealUntil.clear();
+  }
+
+  private boolean isRevealed(String accountId, long now) {
+    Long until = revealUntil.get(accountId);
+    if (until == null) return false;
+    if (now >= until) {
+      revealUntil.remove(accountId);
+      return false;
+    }
+    return true;
+  }
+
+  private void requestReveal(final Account account) {
+    if (revealRequestActive) return;
+    if (!faceStore.isEnrolled()) {
+      Toast.makeText(this, "Register your face in Face unlock settings to reveal codes.",
+          Toast.LENGTH_LONG).show();
+      return;
+    }
+    revealRequestActive = true;
+    pendingRevealAccountId = account.getId();
+    FaceGate.internalNavigation = true;
+    Intent intent = new Intent(this, FaceLockActivity.class);
+    intent.putExtra(FaceLockActivity.EXTRA_MODE, FaceLockActivity.MODE_REVEAL);
+    intent.putExtra(FaceLockActivity.EXTRA_ACCOUNT_LABEL, account.getIssuerOrDefault());
+    startActivityForResult(intent, REQUEST_REVEAL);
   }
 
   private void showAccountMenu(final Account account, View anchor) {
@@ -1221,6 +1347,75 @@ public final class MainActivity extends Activity {
       canvas.drawCircle(cx, cy - r * 0.06f, r * 0.12f, paint);
       canvas.drawRoundRect(cx - r * 0.075f, cy + r * 0.02f, cx + r * 0.075f,
           cy + r * 0.34f, r * 0.07f, r * 0.07f, paint);
+    }
+  }
+
+  /**
+   * Eye control for a locked code. The crossed-out eye carries a small
+   * padlock while the code is hidden; a successful face check opens it.
+   */
+  private static final class EyeIconView extends View {
+    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Path eye = new Path();
+    private boolean revealed;
+
+    EyeIconView(Context context) {
+      super(context);
+      setClickable(true);
+      setFocusable(true);
+      TypedValue value = new TypedValue();
+      if (context.getTheme().resolveAttribute(android.R.attr.selectableItemBackgroundBorderless,
+          value, true)) {
+        setBackgroundResource(value.resourceId);
+      }
+    }
+
+    void setRevealed(boolean revealed) {
+      if (this.revealed != revealed) {
+        this.revealed = revealed;
+        invalidate();
+      }
+    }
+
+    @Override protected void onDraw(Canvas canvas) {
+      super.onDraw(canvas);
+      float cx = getWidth() / 2f;
+      float cy = getHeight() / 2f;
+      float unit = Math.min(getWidth(), getHeight()) / 44f;
+      float halfWidth = 10f * unit;
+
+      paint.setStyle(Paint.Style.STROKE);
+      paint.setStrokeWidth(2f * unit);
+      paint.setStrokeCap(Paint.Cap.ROUND);
+      paint.setStrokeJoin(Paint.Join.ROUND);
+      paint.setColor(revealed ? COLOR_PRIMARY : COLOR_SECONDARY);
+      eye.reset();
+      eye.moveTo(cx - halfWidth, cy);
+      eye.quadTo(cx, cy - 9f * unit, cx + halfWidth, cy);
+      eye.quadTo(cx, cy + 9f * unit, cx - halfWidth, cy);
+      eye.close();
+      canvas.drawPath(eye, paint);
+
+      if (revealed) {
+        paint.setStyle(Paint.Style.FILL);
+        canvas.drawCircle(cx, cy, 3f * unit, paint);
+        return;
+      }
+
+      // Crossed-out eye communicates "hidden"; the padlock below says a face
+      // check is required rather than a simple tap.
+      canvas.drawLine(cx - 8f * unit, cy + 9f * unit,
+          cx + 8f * unit, cy - 9f * unit, paint);
+      paint.setStyle(Paint.Style.FILL);
+      paint.setColor(COLOR_SURFACE);
+      canvas.drawCircle(cx + 7f * unit, cy + 8f * unit, 8f * unit, paint);
+      paint.setColor(COLOR_SECONDARY);
+      canvas.drawRoundRect(cx + 3.5f * unit, cy + 7f * unit, cx + 10.5f * unit,
+          cy + 12f * unit, 1.4f * unit, 1.4f * unit, paint);
+      paint.setStyle(Paint.Style.STROKE);
+      paint.setStrokeWidth(1.5f * unit);
+      canvas.drawArc(cx + 5f * unit, cy + 3.5f * unit, cx + 9f * unit,
+          cy + 7.5f * unit, 180f, 180f, false, paint);
     }
   }
 

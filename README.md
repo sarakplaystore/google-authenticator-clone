@@ -6,6 +6,8 @@ An independent, offline-first Android authenticator for standard time-based one-
 
 - Generate 6- or 8-digit TOTP codes using SHA-1, SHA-256, or SHA-512.
 - Add accounts by scanning a standard `otpauth://totp/...` QR code or entering the Base32 setup key.
+- Keep every code masked by default behind a locked eye icon. Revealing a code requires a fresh front-camera face check; it stays visible for at most 30 seconds and hides again when the app leaves the foreground.
+- Copying a code also requires a face check, so a hidden code cannot be read from the clipboard.
 - Automatically refresh codes and show the remaining time.
 - Search, rename, remove, and copy account codes.
 - Require a custom, on-device face registration before the account list is shown. Setup takes three front-camera samples and creates a six-digit backup PIN.
@@ -22,6 +24,12 @@ The first time the app opens it requires face registration. Three guided front-c
 The lock is a **convenience gate, not security-grade biometrics**. It is implemented independently of the system biometric stack and is more easily spoofed than a dedicated biometric sensor (for example, with a photograph). The TOTP secrets themselves remain AES-GCM encrypted by the Android Keystore. If you forget both your face and your backup PIN, there is no recovery path; reinstall the app to start over, which also deletes the saved accounts.
 
 A front-facing camera is required for initial setup. The app asks for camera permission when you register your face or scan a QR code; no storage or network permission is requested. Changing face registration or the backup PIN is only possible after the app has been unlocked.
+
+### Locked eye icon (per-code reveal gate)
+
+Unlocking the app does **not** expose the verification codes. Every account card shows bullets in place of its digits and a crossed-out eye with a small padlock. Tapping the locked eye—or the card itself—opens the same on-device face screen in a dedicated reveal mode. A live camera frame must match the enrolled face descriptors before the current code is drawn. The eye then becomes an open eye, and tapping it again hides the code immediately.
+
+A successful reveal lasts at most 30 seconds. It is also cleared as soon as the activity pauses (another app, screen off, the recents screen, a lock, or process death), so the next reveal always needs another face scan. Copying is blocked while the code is hidden. The backup PIN created during enrollment can be used instead of a face scan if the camera is unavailable or the scan keeps failing.
 
 ## Demo QR code (test setup)
 
@@ -47,7 +55,7 @@ A dependency-free manual build script is also included. It requires `javac`, `aa
 ./build.sh
 ```
 
-The resulting APK is `Authenticator.apk` (version 1.1.0). The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. Because a local build generates a fresh debug key by default, Android may refuse to update an earlier debug build in place; uninstalling it first also removes its saved accounts and enrolled face. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
+The resulting APK is `Authenticator.apk` (version 1.2.0), which adds the per-code face-check reveal gate. The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. Because a local build generates a fresh debug key by default, Android may refuse to update an earlier debug build in place; uninstalling it first also removes its saved accounts and enrolled face. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
 
 ## Tests
 
@@ -61,6 +69,18 @@ java -cp build/manual/classes:build/test-classes TotpVectors
 java -cp build/manual/classes:build/test-classes FaceTemplateVectors
 ```
 
+## Credits and technology used
+
+The face unlock and per-code reveal gate are implemented from first principles on top of the Android platform. No third-party face-recognition SDK, pre-trained ML model, cloud service, fingerprint sensor, Android `BiometricPrompt`, or Google Play Services is used.
+
+- **Android Camera API** (`android.hardware.Camera`) supplies the front-camera NV21 preview frames used for enrollment and for every unlock/reveal check.
+- **Custom face descriptor** (`FaceTemplate.java`)—a 48×48 illumination-normalised face crop, a 6×6 grid of 8-bin histograms of oriented gradients, and a 24×24 low-frequency thumbnail. Matching uses cosine similarity with a ±1-cell/±1-pixel shift search, and requires two consecutive live reads above the match threshold.
+- **Android Keystore with AES-256-GCM** (`FaceStore.java`)—the face descriptors and backup-PIN hash are encrypted at rest with a non-exportable key generated inside the Android Keystore.
+- **PBKDF2-HMAC-SHA1**—60,000-iteration backup-PIN hashing with a random salt, plus persisted attempt throttling.
+- **ZXing Core 3.5.3**—QR-code decoding. Licensed under Apache 2.0; see [`ZXING-LICENSE.txt`](ZXING-LICENSE.txt) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+- **RFC 4226 / RFC 6238**—HOTP/TOTP code generation in `Totp.java`.
+- **Plain Android views and Canvas**—the eye/lock icon, countdown ring, face oval, and image-free UI are drawn with standard `Activity`, `View`, and `Canvas` APIs, with no UI framework dependency.
+
 ## Implementation and license
 
-The TOTP implementation follows RFC 4226 and RFC 6238. QR decoding uses ZXing Core 3.5.3, whose Apache 2.0 license is included in [`ZXING-LICENSE.txt`](ZXING-LICENSE.txt). See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+The TOTP implementation follows RFC 4226 and RFC 6238. This project is an independent clone of the familiar authenticator workflow; it is not affiliated with Google and contains no Google proprietary code. QR decoding uses ZXing Core 3.5.3, whose Apache 2.0 license is included in [`ZXING-LICENSE.txt`](ZXING-LICENSE.txt). See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
