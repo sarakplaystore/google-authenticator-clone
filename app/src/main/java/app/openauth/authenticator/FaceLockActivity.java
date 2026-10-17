@@ -84,7 +84,7 @@ public final class FaceLockActivity extends Activity
   /** A fresh face check before a hidden verification code is revealed. */
   public static final String MODE_REVEAL = "reveal";
 
-  private enum OverlayMode { ACTIVE, SUCCESS, ERROR }
+  private enum OverlayMode { ACTIVE, ASK_FACE, SUCCESS, ERROR }
 
   // Cue arrows point where the nose should move in the mirrored preview:
   // the user's own left appears on the right side of a selfie preview.
@@ -98,7 +98,22 @@ public final class FaceLockActivity extends Activity
   private static final int COLOR_PRIMARY = Color.rgb(138, 180, 248);
   /** Analyse roughly every 110 ms: fast enough to catch a blink. */
   private static final long FRAME_INTERVAL_MS = 110L;
-  private static final int DETECTOR_WIDTH = 320;
+  /** Larger than before: a face-aligned crop needs a usable eye distance. */
+  private static final int DETECTOR_WIDTH = 384;
+  /** How long the camera can go without a face before the screen asks for one. */
+  private static final long FACE_ASK_DELAY_MS = 1800L;
+  /** Use a detector-derived crop for this long while the detector catches up. */
+  private static final long FACE_CROP_MAX_AGE_MS = 700L;
+  /** Two candidate frames must agree before a scan locks the crop. */
+  private static final int CROP_LOCK_FRAMES = 2;
+  /** Give a working detector this long to frame the face before using the default crop. */
+  private static final long CROP_SEARCH_TIMEOUT_MS = 2500L;
+  /** Crop side around the eyes, as a multiple of the detected eye distance. */
+  private static final float FACE_CROP_EYE_RATIO = 3.2f;
+  /** Move the crop centre this far below the eye midpoint (fraction of its side). */
+  private static final float FACE_CROP_EYE_OFFSET = 0.10f;
+  /** Number of failed scans left at which the UI warns about PIN removal. */
+  private static final int PIN_REMOVAL_WARNING = 5;
 
   private final Handler ui = new Handler();
   private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -114,8 +129,9 @@ public final class FaceLockActivity extends Activity
   private boolean cameraFailed;
   private boolean surfaceReady;
   private boolean showPermissionPanel;
+  /** False while a failure/block panel owns the screen; stops background scans. */
+  private boolean scanRequested;
   private long lastFrameAt;
-  private int frameCounter;
   private int previewWidth;
   private int previewHeight;
   private int sensorRotation;
@@ -131,15 +147,40 @@ public final class FaceLockActivity extends Activity
   private int lastChallengeShown = -1;
   private int lastBlockedSecond = -1;
 
-  // Native platform face detection (presence only; liveness is ours).
+  // Native platform face detection (presence + framing; liveness is ours).
   private FaceDetector faceDetector;
   private int detectorBitmapWidth;
   private int detectorBitmapHeight;
-  private boolean detectorBroken;
+  private volatile boolean detectorBroken;
   private boolean detectorOk;
   private boolean detectorMulti;
   private long lastDetectorAtMs;
   private float lastMeanLuma = -1f;
+
+  // The detector measures where the face is; one crop is then locked for the
+  // whole attempt so turns and nods still move through the crop. These
+  // candidate fields are worker-thread only and travel to the UI inside
+  // FrameResult.
+  private boolean faceCropValid;
+  private long faceCropAtMs = -1L;
+  private float faceCropCenterX = FaceTemplate.DEFAULT_CENTER_X;
+  private float faceCropCenterY = FaceTemplate.DEFAULT_CENTER_Y;
+  private float faceCropSide = FaceTemplate.DEFAULT_SIDE;
+
+  // Locked analysis crop. Written on the UI thread, read on the frame worker.
+  private volatile boolean analysisCropLocked;
+  private volatile float analysisCropX = FaceTemplate.DEFAULT_CENTER_X;
+  private volatile float analysisCropY = FaceTemplate.DEFAULT_CENTER_Y;
+  private volatile float analysisCropSide = FaceTemplate.DEFAULT_SIDE;
+  private volatile long analysisCropGeneration;
+  private int cropCandidateFrames;
+  private long cropSearchStartedAtMs;
+
+  // "Show your face" prompting. UI thread only.
+  private boolean faceAskShown;
+  private long lastFaceSeenAtMs = -1L;
+  private long sessionCropGeneration;
+  private boolean sessionSawFace;
 
   // Enrolment auto-capture state.
   private int enrollStep;
@@ -550,6 +591,15 @@ public final class FaceLockActivity extends Activity
 
   private void applyInitialUi() {
     if (finished || statusView == null) return;
+    // Every new attempt re-centres its analysis crop; a retry after a bad
+    // angle must not inherit the old framing.
+    scanRequested = true;
+    faceAskShown = false;
+    lastFaceSeenAtMs = SystemClock.elapsedRealtime();
+    cropSearchStartedAtMs = lastFaceSeenAtMs;
+    cropCandidateFrames = 0;
+    sessionSawFace = false;
+    unlockAnalysisCrop();
     if (enrollMode) {
       applyEnrollUi();
       return;
@@ -562,13 +612,20 @@ public final class FaceLockActivity extends Activity
     if (enrolled.isEmpty()) {
       captureProgress.setText("");
       stepView.setText(revealMode ? "FACE CHECK" : "FACE UNLOCK");
-      setStatus("Face data unavailable", "Use your backup PIN to "
-          + (revealMode ? "reveal" : "unlock") + ", or register again.");
-      showActions("Use backup PIN", new View.OnClickListener() {
-        @Override public void onClick(View view) { showPinUnlockDialog(); }
-      }, "Cancel", new View.OnClickListener() {
+      boolean hasPin = faceStore.hasPin();
+      setStatus("Face data unavailable", hasPin
+          ? "Use your backup PIN to " + (revealMode ? "reveal" : "unlock") + "."
+          : "Close this screen and register your face again.");
+      View.OnClickListener cancel = new View.OnClickListener() {
         @Override public void onClick(View view) { finishCanceled(); }
-      }, null, null);
+      };
+      if (hasPin) {
+        showActions("Use backup PIN", new View.OnClickListener() {
+          @Override public void onClick(View view) { showPinUnlockDialog(); }
+        }, "Cancel", cancel, null, null);
+      } else {
+        showActions("Cancel", cancel, null, null, null, null);
+      }
       return;
     }
     stepView.setText(revealMode ? "LIVE FACE CHECK" : "FACE UNLOCK");
@@ -581,13 +638,27 @@ public final class FaceLockActivity extends Activity
                 + ". Follow the prompts — they change every time."
             : "Center your face inside the oval, then follow the prompts. "
                 + "They change every time so a photo can't be used.");
-    showActions("Use backup PIN", new View.OnClickListener() {
-      @Override public void onClick(View view) { showPinUnlockDialog(); }
-    }, "Cancel", new View.OnClickListener() {
-      @Override public void onClick(View view) { finishCanceled(); }
-    }, null, null);
+    showPinOrCancelActions();
     overlay.setState(OverlayMode.ACTIVE, 0f, OverlayCue.NONE);
     ensureSession();
+  }
+
+  /**
+   * The fallback row honours the PIN policy: after the backup PIN has been
+   * removed (or for a legacy registration that never had one) there is no
+   * button that would only open a "No backup PIN" dialog.
+   */
+  private void showPinOrCancelActions() {
+    View.OnClickListener cancel = new View.OnClickListener() {
+      @Override public void onClick(View view) { finishCanceled(); }
+    };
+    if (faceStore.hasPin()) {
+      showActions("Use backup PIN", new View.OnClickListener() {
+        @Override public void onClick(View view) { showPinUnlockDialog(); }
+      }, "Cancel", cancel, null, null);
+    } else {
+      showActions("Cancel", cancel, null, null, null, null);
+    }
   }
 
   private void applyEnrollUi() {
@@ -651,21 +722,37 @@ public final class FaceLockActivity extends Activity
 
   private void showFaceBlockedPanel() {
     session = null;
+    scanRequested = false;
     lastBlockedSecond = -1;
     stepView.setText(revealMode ? "FACE CHECK" : "FACE UNLOCK");
     captureProgress.setText("");
-    setStatus("Face scan paused", blockedMessage());
-    showActions("Use backup PIN", new View.OnClickListener() {
-      @Override public void onClick(View view) { showPinUnlockDialog(); }
-    }, "Cancel", new View.OnClickListener() {
-      @Override public void onClick(View view) { finishCanceled(); }
-    }, null, null);
+    boolean pinRemoved = !faceStore.hasPin() && faceStore.wasPinRemovedByFailures();
+    setStatus(pinRemoved ? "Backup PIN removed" : "Face scan paused", blockedMessage());
+    showPinOrCancelActions();
     overlay.setState(OverlayMode.ERROR, 0f, OverlayCue.NONE);
   }
 
   private String blockedMessage() {
-    return "Too many failed face attempts. Try again in "
-        + faceStore.faceCooldownSeconds() + " seconds, or use your backup PIN now.";
+    String cooldown = "Too many failed face attempts. Try again in "
+        + faceStore.faceCooldownSeconds() + " seconds";
+    if (faceStore.hasPin()) {
+      return cooldown + ", or use your backup PIN now."
+          + pinRemovalWarning();
+    }
+    if (faceStore.wasPinRemovedByFailures()) {
+      return cooldown + ". The backup PIN was removed after too many invalid scans, "
+          + "so face unlock is the only way back in.";
+    }
+    return cooldown + ".";
+  }
+
+  /** Warn before the backup PIN disappears, so the limit is never a surprise. */
+  private String pinRemovalWarning() {
+    if (!faceStore.hasPin()) return "";
+    int remaining = faceStore.scansUntilPinRemoval();
+    if (remaining <= 0 || remaining > PIN_REMOVAL_WARNING) return "";
+    return " " + remaining + (remaining == 1 ? " more failed scan will" : " more failed scans will")
+        + " remove the backup PIN.";
   }
 
   private void tickBlockedCountdown() {
@@ -680,8 +767,101 @@ public final class FaceLockActivity extends Activity
     int seconds = faceStore.faceCooldownSeconds();
     if (seconds != lastBlockedSecond) {
       lastBlockedSecond = seconds;
-      setStatus("Face scan paused", blockedMessage());
+      boolean pinRemoved = !faceStore.hasPin() && faceStore.wasPinRemovedByFailures();
+      setStatus(pinRemoved ? "Backup PIN removed" : "Face scan paused", blockedMessage());
     }
+  }
+
+  // ------------------------------------------------------- face visibility
+
+  /**
+   * Tracks whether a face is visible. When the camera has gone without one
+   * for a moment, a single haptic asks the user to show their face and the
+   * status panel is switched to that prompt. Frames keep flowing, so the
+   * prompt disappears the moment a face step can start.
+   */
+  private void updateFacePresence(FrameResult result) {
+    long now = result.tMs;
+    if (result.facePresent) {
+      lastFaceSeenAtMs = now;
+      faceAskShown = false;
+      return;
+    }
+    if (lastFaceSeenAtMs < 0L) lastFaceSeenAtMs = now;
+    if (!faceAskShown && now - lastFaceSeenAtMs >= FACE_ASK_DELAY_MS) {
+      faceAskShown = true;
+      haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+    }
+  }
+
+  private void showFaceAsk() {
+    if (finished) return;
+    if (enrollMode) {
+      captureProgress.setText(enrollDots());
+      stepView.setText("STEP " + Math.min(4, enrollStep + 1) + " OF 4");
+      setStatus("Show your face",
+          "The camera can't see a face yet. Bring your whole face into the oval, "
+              + "hold the phone at eye level, and avoid bright light behind you.");
+      overlay.setState(OverlayMode.ASK_FACE, captured.size() / 3f, OverlayCue.NONE);
+      return;
+    }
+    captureProgress.setText("");
+    stepView.setText(revealMode ? "LIVE FACE CHECK" : "FACE UNLOCK");
+    setStatus("Show your face",
+        "The camera can't see a face yet. Move into the oval and hold still "
+            + (revealMode ? "to reveal the code." : "to unlock."));
+    overlay.setState(OverlayMode.ASK_FACE,
+        session != null ? session.getProgress() : 0f, OverlayCue.NONE);
+  }
+
+  // ------------------------------------------------------------ analysis crop
+
+  /** Drops the locked crop so the next attempt can frame the face afresh. */
+  private void unlockAnalysisCrop() {
+    analysisCropLocked = false;
+    analysisCropGeneration++;
+    cropCandidateFrames = 0;
+  }
+
+  private void lockAnalysisCrop(float centerX, float centerY, float side) {
+    analysisCropX = centerX;
+    analysisCropY = centerY;
+    analysisCropSide = side;
+    analysisCropLocked = true;
+    analysisCropGeneration++;
+    cropCandidateFrames = 0;
+  }
+
+  /**
+   * Locks a crop once the platform detector has produced a usable candidate
+   * on a couple of frames. If the detector cannot frame a face that the
+   * landmark geometry already sees (or the native detector is unavailable),
+   * the long-standing fixed centre crop is used instead.
+   */
+  private boolean maybeLockAnalysisCrop(FrameResult result) {
+    if (analysisCropLocked) return true;
+    if (result.candidateUsable) {
+      if (++cropCandidateFrames >= CROP_LOCK_FRAMES) {
+        lockAnalysisCrop(result.candidateX, result.candidateY, result.candidateSide);
+        return true;
+      }
+      return false;
+    }
+    cropCandidateFrames = 0;
+    if (result.facePresent && (result.detectorBroken
+        || result.tMs - cropSearchStartedAtMs >= CROP_SEARCH_TIMEOUT_MS)) {
+      lockAnalysisCrop(FaceTemplate.DEFAULT_CENTER_X, FaceTemplate.DEFAULT_CENTER_Y,
+          FaceTemplate.DEFAULT_SIDE);
+      return true;
+    }
+    return false;
+  }
+
+  private void maybeStartSession(FrameResult result) {
+    if (finished || enrollMode || session != null || !scanRequested) return;
+    if (faceStore.isFaceBlocked() || enrolled.isEmpty()) return;
+    if (!maybeLockAnalysisCrop(result)) return;
+    ensureSession();
   }
 
   private void showActions(String primaryText, View.OnClickListener primaryListener,
@@ -743,6 +923,32 @@ public final class FaceLockActivity extends Activity
     // Step 4 means the PIN step is already on screen; ignore further frames
     // so a second blink cannot stack another dialog.
     if (finished || !cameraStarted || enrollStep >= 4) return;
+    // Drop a frame that was measured with a crop that has since been replaced.
+    if (result.cropGeneration != analysisCropGeneration) return;
+
+    boolean wasAsking = faceAskShown;
+    updateFacePresence(result);
+    if (!analysisCropLocked) {
+      if (result.facePresent) {
+        if (wasAsking) {
+          overlay.setState(OverlayMode.ACTIVE, captured.size() / 3f, enrollCue());
+        }
+        setStatus("Hold still", "Getting your face in focus…");
+      } else if (faceAskShown) {
+        showFaceAsk();
+      } else {
+        setStatus("Center your face", "Keep your whole face inside the oval.");
+      }
+      if (maybeLockAnalysisCrop(result)) {
+        applyEnrollUi();
+      }
+      // The frame that triggered the lock was measured with the previous
+      // crop; the next frame is captured with the locked one.
+      return;
+    }
+    if (wasAsking && !faceAskShown) {
+      overlay.setState(OverlayMode.ACTIVE, captured.size() / 3f, enrollCue());
+    }
     if (result.template == null || !result.template.isUsable() || result.signals == null) {
       enrollHoldFrames = 0;
       setStatus("Move to better light",
@@ -751,7 +957,11 @@ public final class FaceLockActivity extends Activity
     }
     if (!result.facePresent) {
       enrollHoldFrames = 0;
-      setStatus("Center your face", "Keep your whole face inside the oval.");
+      if (faceAskShown) {
+        showFaceAsk();
+      } else {
+        setStatus("Center your face", "Keep your whole face inside the oval.");
+      }
       return;
     }
     if (enrollStep >= 3) {
@@ -1004,8 +1214,12 @@ public final class FaceLockActivity extends Activity
     if (!faceStore.hasPin()) {
       new AlertDialog.Builder(this)
           .setTitle("No backup PIN")
-          .setMessage("A backup PIN was not saved on this device. Register your face again "
-              + "to create one.")
+          .setMessage(faceStore.wasPinRemovedByFailures()
+              ? "The backup PIN was removed after more than "
+                  + FaceStore.MAX_INVALID_SCANS + " invalid face scans. Unlock with "
+                  + "your face, then set a new PIN under Face unlock settings."
+              : "A backup PIN was not saved on this device. Unlock with your face, then "
+                  + "set a PIN under Face unlock settings.")
           .setPositiveButton("OK", null)
           .show();
       return;
@@ -1110,6 +1324,7 @@ public final class FaceLockActivity extends Activity
   private void showCameraPermissionPanel() {
     if (finished) return;
     showPermissionPanel = true;
+    scanRequested = false;
     session = null;
     titleView.setText(enrollMode ? "Register your face"
         : revealMode ? "Reveal verification code" : "Unlock Authenticator");
@@ -1125,9 +1340,10 @@ public final class FaceLockActivity extends Activity
       }
     }, "Open app settings", new View.OnClickListener() {
       @Override public void onClick(View view) { openAppSettings(); }
-    }, enrollMode ? null : "Use backup PIN", new View.OnClickListener() {
-      @Override public void onClick(View view) { showPinUnlockDialog(); }
-    });
+    }, !enrollMode && faceStore.hasPin() ? "Use backup PIN" : null,
+        new View.OnClickListener() {
+          @Override public void onClick(View view) { showPinUnlockDialog(); }
+        });
   }
 
   private void openAppSettings() {
@@ -1143,23 +1359,28 @@ public final class FaceLockActivity extends Activity
   private void showCameraProblem(String detail) {
     if (finished) return;
     cameraStarted = false;
+    scanRequested = false;
     session = null;
     captureProgress.setText("");
     stepView.setText(enrollMode ? "CAMERA REQUIRED"
         : revealMode ? "FACE CHECK" : "FACE UNLOCK");
-    setStatus("Camera unavailable", detail);
+    setStatus("Camera unavailable", detail
+        + (enrollMode || faceStore.hasPin() ? ""
+            : " There is no backup PIN on this device; a face scan is the only way in."));
+    View.OnClickListener retry = new View.OnClickListener() {
+      @Override public void onClick(View view) { retryCamera(); }
+    };
+    View.OnClickListener close = new View.OnClickListener() {
+      @Override public void onClick(View view) { finishCanceled(); }
+    };
     if (enrollMode) {
-      showActions("Try again", new View.OnClickListener() {
-        @Override public void onClick(View view) { retryCamera(); }
-      }, "Close", new View.OnClickListener() {
-        @Override public void onClick(View view) { finishCanceled(); }
-      }, null, null);
-    } else {
+      showActions("Try again", retry, "Close", close, null, null);
+    } else if (faceStore.hasPin()) {
       showActions("Use backup PIN", new View.OnClickListener() {
         @Override public void onClick(View view) { showPinUnlockDialog(); }
-      }, "Try camera again", new View.OnClickListener() {
-        @Override public void onClick(View view) { retryCamera(); }
-      }, null, null);
+      }, "Try camera again", retry, null, null);
+    } else {
+      showActions("Try camera again", retry, "Close", close, null, null);
     }
   }
 
@@ -1282,15 +1503,20 @@ public final class FaceLockActivity extends Activity
     releaseCamera();
     cameraFailed = true;
     showCameraProblem("The front camera could not be opened. Close other camera apps, "
-        + "then try again, or use your backup PIN.");
+        + "then try again.");
   }
 
   private void releaseCamera() {
     cameraStarted = false;
+    scanRequested = false;
     session = null;
     lastChallengeShown = -1;
     detectorOk = false;
     detectorMulti = false;
+    faceAskShown = false;
+    lastFaceSeenAtMs = -1L;
+    sessionSawFace = false;
+    unlockAnalysisCrop();
     if (camera == null) return;
     try {
       camera.setPreviewCallback(null);
@@ -1365,11 +1591,23 @@ public final class FaceLockActivity extends Activity
     float simLeft = -1f;
     float simRight = -1f;
     boolean strictStraight;
+    /** Which locked crop this frame was measured with. */
+    boolean cropLocked;
+    long cropGeneration;
+    /** A detector-framed crop that could replace the default one. */
+    boolean candidateUsable;
+    float candidateX;
+    float candidateY;
+    float candidateSide;
+    boolean detectorBroken;
   }
 
   @Override public void onPreviewFrame(byte[] data, Camera source) {
     if (data == null || finished || camera == null || worker.isShutdown()) return;
-    if (!enrollMode && session == null) return;
+    // Frames are analysed while waiting for a face too, so "show your face"
+    // can appear before a liveness session exists. A failure panel or a PIN
+    // dialog sets scanRequested false and stops the work.
+    if (!enrollMode && !scanRequested) return;
     long now = SystemClock.elapsedRealtime();
     if (now - lastFrameAt < FRAME_INTERVAL_MS) return;
     if (!processing.compareAndSet(false, true)) return;
@@ -1380,7 +1618,11 @@ public final class FaceLockActivity extends Activity
     final int height = previewHeight;
     final int rotation = sensorRotation;
     final boolean flash = flashLit;
-    final boolean runDetector = (++frameCounter % 2 == 0);
+    final boolean locked = analysisCropLocked;
+    final float cropX = locked ? analysisCropX : FaceTemplate.DEFAULT_CENTER_X;
+    final float cropY = locked ? analysisCropY : FaceTemplate.DEFAULT_CENTER_Y;
+    final float cropSide = locked ? analysisCropSide : FaceTemplate.DEFAULT_SIDE;
+    final long generation = analysisCropGeneration;
     final List<FaceTemplate> enrolledSnapshot = enrolled;
     try {
       worker.execute(new Runnable() {
@@ -1388,11 +1630,31 @@ public final class FaceLockActivity extends Activity
           final FrameResult result = new FrameResult();
           result.tMs = now;
           result.flashOn = flash;
+          result.cropLocked = locked;
+          result.cropGeneration = generation;
           try {
-            result.template = FaceTemplate.fromFrame(frame, width, height, rotation);
-            result.signals = FaceSignals.fromFrame(frame, width, height, rotation);
-            if (runDetector) {
-              updatePlatformDetector(frame, width, height, rotation);
+            // Run the platform detector first: its face box anchors the crop
+            // that this frame (and the whole attempt) is measured in.
+            updatePlatformDetector(frame, width, height, rotation, now);
+            result.detectorBroken = detectorBroken;
+            result.template = FaceTemplate.fromFrame(frame, width, height, rotation,
+                cropX, cropY, cropSide);
+            result.signals = FaceSignals.fromFrame(frame, width, height, rotation,
+                cropX, cropY, cropSide);
+            if (!locked && faceCropValid && now - faceCropAtMs <= FACE_CROP_MAX_AGE_MS) {
+              // Validate the detector-framed crop before the UI locks it:
+              // it must contain a usable descriptor and locatable eyes.
+              FaceTemplate candidateTemplate = FaceTemplate.fromFrame(frame, width, height,
+                  rotation, faceCropCenterX, faceCropCenterY, faceCropSide);
+              FaceSignals candidateSignals = FaceSignals.fromFrame(frame, width, height,
+                  rotation, faceCropCenterX, faceCropCenterY, faceCropSide);
+              result.candidateUsable = candidateTemplate != null && candidateTemplate.isUsable()
+                  && candidateSignals != null && candidateSignals.eyesFound;
+              if (result.candidateUsable) {
+                result.candidateX = faceCropCenterX;
+                result.candidateY = faceCropCenterY;
+                result.candidateSide = faceCropSide;
+              }
             }
             boolean detectorRecent = now - lastDetectorAtMs <= 900L;
             result.multiFace = detectorRecent && detectorMulti;
@@ -1434,11 +1696,19 @@ public final class FaceLockActivity extends Activity
 
   /**
    * Runs the platform face detector on a downscaled upright copy of the
-   * frame. It only vouches for presence (exactly one plausibly sized face
-   * near the middle); photo-versus-person discrimination is the liveness
-   * session's job, because this detector happily finds faces in photos.
+   * frame. It vouches for presence (exactly one plausibly sized face near
+   * the middle) and supplies the face midpoint and eye distance used to lock
+   * the crop that the descriptor and liveness landmarks are measured in.
+   * Photo-versus-person discrimination is the liveness session's job, because
+   * this detector happily finds faces in photos.
+   *
+   * <p>The detector consumes luminance only. A local percentile stretch
+   * before detection keeps a dim face detectable (the previous fixed-luma
+   * bitmap lost faces in low light), without touching the frames used for
+   * identity or liveness.</p>
    */
-  private void updatePlatformDetector(byte[] nv21, int width, int height, int rotation) {
+  private void updatePlatformDetector(byte[] nv21, int width, int height, int rotation,
+      long now) {
     if (detectorBroken) return;
     Bitmap bitmap = null;
     Bitmap converted = null;
@@ -1449,7 +1719,7 @@ public final class FaceLockActivity extends Activity
       int targetHeight = Math.round(targetWidth * uprightHeight / (float) uprightWidth);
       targetHeight = Math.max(160, Math.min(640, targetHeight));
       if ((targetHeight & 1) == 1) targetHeight++;
-      int[] pixels = new int[targetWidth * targetHeight];
+      int[] luma = new int[targetWidth * targetHeight];
       for (int y = 0; y < targetHeight; y++) {
         float uy = y * (uprightHeight - 1) / (float) Math.max(1, targetHeight - 1);
         for (int x = 0; x < targetWidth; x++) {
@@ -1471,9 +1741,45 @@ public final class FaceLockActivity extends Activity
           }
           sourceX = Math.max(0, Math.min(width - 1, sourceX));
           sourceY = Math.max(0, Math.min(height - 1, sourceY));
-          pixels[y * targetWidth + x] = nv21Pixel(nv21, width, height, sourceX, sourceY);
+          luma[y * targetWidth + x] = nv21[sourceY * width + sourceX] & 0xff;
         }
       }
+
+      // Percentile contrast stretch (2 %..98 %). In low light the face
+      // occupies a narrow luma band; stretching it gives the detector the
+      // contrast it needs. In normal light this is nearly a no-op.
+      int[] histogram = new int[256];
+      for (int value : luma) histogram[value]++;
+      int cut = Math.max(1, luma.length / 50);
+      int low = 0;
+      int high = 255;
+      int accumulated = 0;
+      for (int value = 0; value < 256; value++) {
+        accumulated += histogram[value];
+        if (accumulated >= cut) {
+          low = value;
+          break;
+        }
+      }
+      accumulated = 0;
+      for (int value = 255; value >= 0; value--) {
+        accumulated += histogram[value];
+        if (accumulated >= cut) {
+          high = value;
+          break;
+        }
+      }
+      if (high - low < 24) {
+        low = 0;
+        high = 255;
+      }
+      int span = Math.max(1, high - low);
+      int[] pixels = new int[luma.length];
+      for (int i = 0; i < luma.length; i++) {
+        int value = Math.max(0, Math.min(255, (luma[i] - low) * 255 / span));
+        pixels[i] = 0xff000000 | (value * 0x00010101);
+      }
+
       bitmap = Bitmap.createBitmap(pixels, targetWidth, targetHeight, Bitmap.Config.ARGB_8888);
       converted = bitmap.copy(Bitmap.Config.RGB_565, false);
       if (converted == null) return;
@@ -1490,68 +1796,120 @@ public final class FaceLockActivity extends Activity
       if (found == 1 && faces[0] != null && faces[0].confidence() >= 0.30f) {
         PointF midpoint = new PointF();
         faces[0].getMidPoint(midpoint);
-        float eyesNorm = faces[0].eyesDistance() / targetWidth;
+        float eyeDistance = faces[0].eyesDistance();
+        float eyesNorm = eyeDistance / targetWidth;
         detectorOk = eyesNorm >= 0.10f && eyesNorm <= 0.60f
             && midpoint.x >= targetWidth * 0.14f && midpoint.x <= targetWidth * 0.86f
             && midpoint.y >= targetHeight * 0.06f && midpoint.y <= targetHeight * 0.88f;
+        if (detectorOk) {
+          // Anchor a square crop on the eye pair. Its side follows the
+          // interpupillary distance so the descriptor sees the same face
+          // scale whether the phone is close or far away, and its centre sits
+          // a little below the eyes (the eye midpoint is not the face centre).
+          float sidePixels = eyeDistance * FACE_CROP_EYE_RATIO;
+          float targetShort = Math.min(targetWidth, targetHeight);
+          float sideFraction = clampFloat(sidePixels / targetShort, 0.40f, 0.98f);
+          float centerX = midpoint.x / (float) targetWidth;
+          float centerY = (midpoint.y + sidePixels * FACE_CROP_EYE_OFFSET)
+              / (float) targetHeight;
+          float uprightShort = Math.min(uprightWidth, uprightHeight);
+          float halfX = sideFraction * uprightShort / (2f * uprightWidth);
+          float halfY = sideFraction * uprightShort / (2f * uprightHeight);
+          faceCropCenterX = clampFloat(centerX, halfX, 1f - halfX);
+          faceCropCenterY = clampFloat(centerY, halfY, 1f - halfY);
+          faceCropSide = sideFraction;
+          faceCropAtMs = now;
+          faceCropValid = true;
+        }
       }
-      lastDetectorAtMs = SystemClock.elapsedRealtime();
+      lastDetectorAtMs = now;
     } catch (RuntimeException e) {
       // Some builds ship without the detector's native library. Presence
       // then falls back to the landmark geometry; liveness is unaffected.
       detectorBroken = true;
       detectorOk = false;
       detectorMulti = false;
+      faceCropValid = false;
     } finally {
       if (bitmap != null) bitmap.recycle();
       if (converted != null) converted.recycle();
     }
   }
 
-  private static int nv21Pixel(byte[] nv21, int width, int height, int x, int y) {
-    int luma = nv21[y * width + x] & 0xff;
-    int chromaIndex = width * height + (y / 2) * width + (x & ~1);
-    int v = 128;
-    int u = 128;
-    if (chromaIndex + 1 < nv21.length) {
-      v = nv21[chromaIndex] & 0xff;
-      u = nv21[chromaIndex + 1] & 0xff;
-    }
-    int yy = Math.max(0, luma - 16) * 1192;
-    int r = yy + 1634 * (v - 128);
-    int g = yy - 833 * (v - 128) - 400 * (u - 128);
-    int b = yy + 2066 * (u - 128);
-    r = Math.max(0, Math.min(262143, r)) >> 10;
-    g = Math.max(0, Math.min(262143, g)) >> 10;
-    b = Math.max(0, Math.min(262143, b)) >> 10;
-    return 0xff000000 | (r << 16) | (g << 8) | b;
+  private static float clampFloat(float value, float min, float max) {
+    return Math.max(min, Math.min(max, value));
   }
 
   // ------------------------------------------------------- unlock / reveal flow
 
   private void ensureSession() {
     if (enrollMode || session != null || !cameraStarted || finished) return;
-    if (enrolled.isEmpty() || faceStore.isFaceBlocked()) return;
+    if (enrolled.isEmpty() || faceStore.isFaceBlocked() || !scanRequested) return;
+    // Wait until a crop has been locked. Starting before the face is visible
+    // meant an empty room could consume the session timeout and count as a
+    // failed attempt.
+    if (!analysisCropLocked) return;
     boolean posesDistinct = enrolled.size() >= 3
         && enrolled.get(1).similarity(enrolled.get(2)) <= 0.965f;
     session = new LivenessSession(sessionRandom, posesDistinct,
         SystemClock.elapsedRealtime());
+    sessionCropGeneration = analysisCropGeneration;
+    sessionSawFace = false;
     lastChallengeShown = -1;
   }
 
   private void onUnlockFrame(FrameResult result) {
-    if (finished || session == null) return;
+    if (finished) return;
+    if (result.cropGeneration != analysisCropGeneration) return;
+    boolean wasAsking = faceAskShown;
+    updateFacePresence(result);
+    if (session == null) {
+      maybeStartSession(result);
+    }
+    if (session == null) {
+      // Waiting for a face or for the crop lock. Nothing is being counted as
+      // a failed scan while the camera cannot see the user.
+      if (!result.facePresent) {
+        if (faceAskShown) {
+          showFaceAsk();
+        }
+      } else {
+        if (wasAsking && !faceAskShown) {
+          overlay.setState(OverlayMode.ACTIVE, 0f, OverlayCue.NONE);
+        }
+        if (result.template == null || !result.template.isUsable()) {
+          setStatus("Move to better light",
+              "Keep your whole face inside the oval. Avoid strong backlight.");
+        } else {
+          setStatus("Hold still", "Getting your face in focus…");
+        }
+      }
+      return;
+    }
+    if (!result.cropLocked || result.cropGeneration != sessionCropGeneration) {
+      // A frame measured with the previous crop must not enter the baseline
+      // or the liveness arithmetic.
+      return;
+    }
+    if (wasAsking && !faceAskShown) {
+      overlay.setState(OverlayMode.ACTIVE, session.getProgress(), cueForSession());
+    }
     if (result.template == null || !result.template.isUsable()) {
       LivenessSession.Frame cold = new LivenessSession.Frame();
       cold.tMs = result.tMs;
       cold.usable = false;
       session.onFrame(cold);
       if (!session.isFinished()) {
-        setStatus("Move to better light",
-            "Keep your whole face inside the oval. Avoid strong backlight.");
+        if (faceAskShown && !result.facePresent) {
+          showFaceAsk();
+        } else {
+          setStatus("Move to better light",
+              "Keep your whole face inside the oval. Avoid strong backlight.");
+        }
         return;
       }
     } else {
+      if (result.facePresent) sessionSawFace = true;
       LivenessSession.Frame frame = new LivenessSession.Frame();
       frame.tMs = result.tMs;
       frame.signals = result.signals;
@@ -1575,6 +1933,10 @@ public final class FaceLockActivity extends Activity
   }
 
   private void syncSessionUi(FrameResult result) {
+    if (faceAskShown && !result.facePresent) {
+      showFaceAsk();
+      return;
+    }
     LivenessSession.Phase phase = session.getPhase();
     int done = session.getChallengesDone();
     if (done != lastChallengeShown && phase != LivenessSession.Phase.BASELINE) {
@@ -1657,10 +2019,25 @@ public final class FaceLockActivity extends Activity
   }
 
   private void onSessionFailed(LivenessSession.FailReason reason) {
+    // A session that never got a single usable face frame is not an invalid
+    // scan: the user simply was not in front of the camera. Ask for a face
+    // and start over instead of counting it.
+    if (reason == LivenessSession.FailReason.TIMEOUT && !sessionSawFace) {
+      session = null;
+      scanRequested = true;
+      faceAskShown = true;
+      unlockAnalysisCrop();
+      cropSearchStartedAtMs = SystemClock.elapsedRealtime();
+      showFaceAsk();
+      return;
+    }
+
     session = null;
+    scanRequested = false;
+    boolean pinRemoved = false;
     if (reason != LivenessSession.FailReason.FACE_LOST
         && reason != LivenessSession.FailReason.NONE) {
-      faceStore.recordFaceFailure();
+      pinRemoved = faceStore.recordFaceFailure();
     }
     hapticReject();
     overlay.setState(OverlayMode.ERROR, 0f, OverlayCue.NONE);
@@ -1668,12 +2045,18 @@ public final class FaceLockActivity extends Activity
       showFaceBlockedPanel();
       return;
     }
+    if (pinRemoved) {
+      showPinRemovedPanel();
+      return;
+    }
+    boolean hasPin = faceStore.hasPin();
     String status;
     String instruction;
     if (reason == LivenessSession.FailReason.WRONG_FACE) {
       status = "Face not recognized";
       instruction = "This doesn't match the enrolled face. Try even light without "
-          + "anything covering your face, or use your PIN.";
+          + "anything covering your face"
+          + (hasPin ? ", or use your backup PIN." : ", then try again.");
     } else if (reason == LivenessSession.FailReason.SPOOF_SCREEN) {
       status = "That looked like a screen";
       instruction = "Use your real face in front of the camera — photos and videos "
@@ -1693,16 +2076,35 @@ public final class FaceLockActivity extends Activity
       instruction = "Follow each prompt as it appears. The order is different every time.";
     }
     captureProgress.setText("");
-    setStatus(status, instruction);
+    setStatus(status, instruction + pinRemovalWarning());
+    View.OnClickListener cancel = new View.OnClickListener() {
+      @Override public void onClick(View view) { finishCanceled(); }
+    };
+    View.OnClickListener retry = new View.OnClickListener() {
+      @Override public void onClick(View view) { applyInitialUi(); }
+    };
+    if (hasPin) {
+      showActions("Try again", retry, "Use backup PIN", new View.OnClickListener() {
+        @Override public void onClick(View view) { showPinUnlockDialog(); }
+      }, "Cancel", cancel);
+    } else {
+      showActions("Try again", retry, "Cancel", cancel, null, null);
+    }
+  }
+
+  private void showPinRemovedPanel() {
+    scanRequested = false;
+    stepView.setText(revealMode ? "FACE CHECK" : "FACE UNLOCK");
+    captureProgress.setText("");
+    setStatus("Backup PIN removed", "More than " + FaceStore.MAX_INVALID_SCANS
+        + " invalid face scans deleted the backup PIN. Unlock with your face; after "
+        + "unlocking you can set a new PIN under Face unlock settings.");
+    overlay.setState(OverlayMode.ERROR, 0f, OverlayCue.NONE);
     showActions("Try again", new View.OnClickListener() {
-      @Override public void onClick(View view) {
-        applyInitialUi();
-      }
-    }, "Use backup PIN", new View.OnClickListener() {
-      @Override public void onClick(View view) { showPinUnlockDialog(); }
+      @Override public void onClick(View view) { applyInitialUi(); }
     }, "Cancel", new View.OnClickListener() {
       @Override public void onClick(View view) { finishCanceled(); }
-    });
+    }, null, null);
   }
 
   // -------------------------------------------------------------- screen light
@@ -1716,7 +2118,7 @@ public final class FaceLockActivity extends Activity
     boolean flash = session != null
         && session.isFlashOn(SystemClock.elapsedRealtime());
     boolean fill = !flash && cameraStarted && lastMeanLuma >= 0f && lastMeanLuma < 45f
-        && (session != null || enrollMode);
+        && (session != null || enrollMode || scanRequested);
     flashLit = flash;
     float targetAlpha = flash ? 0.88f : fill ? 0.22f : 0f;
     if (Math.abs(flashView.getAlpha() - targetAlpha) > 0.01f) {
@@ -1834,7 +2236,8 @@ public final class FaceLockActivity extends Activity
       canvas.restoreToCount(save);
 
       int accent = mode == OverlayMode.SUCCESS ? 0xFF34C77B
-          : mode == OverlayMode.ERROR ? 0xFFE5534B : 0xCCFFFFFF;
+          : mode == OverlayMode.ERROR ? 0xFFE5534B
+          : mode == OverlayMode.ASK_FACE ? 0xFFF2B33D : 0xCCFFFFFF;
       border.setColor(accent);
       border.setStrokeWidth(mode == OverlayMode.ACTIVE ? dp(2) : dp(3.5f));
       canvas.drawOval(oval, border);

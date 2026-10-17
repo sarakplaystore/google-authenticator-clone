@@ -94,6 +94,20 @@ public final class FaceSignals {
     return fromGray(gray);
   }
 
+  /**
+   * Analyses the same frame using an explicit face crop. The activity locks a
+   * crop once per scan so every landmark is measured in one stable
+   * coordinate frame; following the detected face on every frame would
+   * cancel out the head movement the liveness challenges are meant to see.
+   */
+  public static FaceSignals fromFrame(byte[] nv21, int width, int height, int rotation,
+      float centerX, float centerY, float sideFraction) {
+    float[] gray = FaceTemplate.sampleFaceSized(nv21, width, height, rotation, SIZE,
+        centerX, centerY, sideFraction);
+    if (gray == null) return null;
+    return fromGray(gray);
+  }
+
   /** Analyses a 96×96 grayscale crop. Separated for plain-JVM tests. */
   public static FaceSignals fromGray(float[] gray) {
     if (gray == null || gray.length != SIZE * SIZE) return null;

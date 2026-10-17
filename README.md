@@ -10,7 +10,7 @@ An independent, offline-first Android authenticator for standard time-based one-
 - Copying a code also requires a face check, so a hidden code cannot be read from the clipboard.
 - Automatically refresh codes and show the remaining time.
 - Search, rename, remove, and copy account codes.
-- Require a custom, on-device face registration before the account list is shown. Setup auto-captures three guided angles (straight, your left, your right) plus a blink, and creates a six-digit backup PIN.
+- Require a custom, on-device face registration before the account list is shown. Setup auto-captures three guided angles (straight, your left, your right) plus a blink, and creates a six-digit backup PIN. More than 20 consecutive invalid face scans delete that PIN; the face registration stays enrolled, so the owner can still unlock with a live scan and set a new PIN.
 - Unlock with a live face check on every app open: three prompts (blink, turn left/right, nod) in a random order that changes every attempt, performed by the enrolled face — a photo or a replayed video cannot follow them. The app does **not** use Android's biometric prompt, fingerprint sensors, Touch ID, or the device's built-in face unlock, and it does not request biometric permissions.
 - Fit any phone screen: the camera preview is full-screen edge-to-edge and centre-cropped (never stretched), the face guide is laid out in the measured free space, and notch/gesture-bar insets are honoured on every Android version.
 - Encrypt account data with AES-GCM using the Android Keystore; Android backup is disabled. Face descriptors and the PIN hash are separately encrypted with the Keystore.
@@ -22,13 +22,16 @@ Google migration/transfer QR codes, HOTP accounts, cloud sync, and account expor
 
 The first time the app opens it requires face registration. Three guided front-camera samples (straight, turned to your left, turned to your right — captured automatically when you hold each angle) and a blink are reduced to numeric descriptors, encrypted with a key in the Android Keystore, and stored only on the device. Camera images are never written to storage. A six-digit backup PIN is created at the same time and can be used if a scan fails in poor light or with different eyewear. Registrations made by older versions keep working.
 
+Each attempt locks **one face-aligned crop** from the platform face detector (its eye pair and eye distance) and uses that same crop for the descriptor and for every liveness landmark. Following the face on every frame would cancel out the small turns and nods the challenges measure, so the crop is fixed for the attempt and only re-acquired after a retry. When no face is visible the screen asks **“Show your face”** after about two seconds instead of just waiting for the scan to time out. The detector runs on a contrast-stretched, upright copy of the preview, which keeps faces detectable in dim rooms without changing the frames used for identity or liveness.
+
 A scan is a **live check, not just an image match**:
 
 - Three challenges — blink, turn left, turn right, nod down — are drawn at random (with a `SecureRandom`) and asked in a random order, returning to centre between them. Every frame that counts towards a challenge must still match the enrolled face; turns must match the enrolled sample *for that side* and show the mouth moving further than the eyes (3D parallax a flat photo does not have, even when the photo itself is turned).
 - The screen flashes at random times and the face must measurably brighten in response (skipped in already-bright surroundings). An emissive replay on another phone does not respond; frames showing the regular moiré grid of a photographed display are rejected outright.
 - The platform face detector must see exactly one face, failed attempts pause face scanning for a cooldown (5 failures → 30 s, persisted like the PIN throttle), and the final confirmation requires both descriptor components to agree on three consecutive centred frames at a stricter threshold.
+- More than 20 **consecutive invalid face scans** (the 21st failed scan) delete the backup PIN. The threshold survives cooldowns and app restarts; a successful unlock (a live scan or the backup PIN itself) resets it, and a face-free wait or a check that never saw a face does not count. This limits how long a PIN can be guessed after a device is picked up, while keeping face unlock (and the ability to set a new PIN after unlocking) available to the owner.
 
-This is still a **camera-only check, not certified biometrics**: it is built so that photographs, printed cut-outs, and replayed videos fail, but it cannot match a dedicated infrared/depth sensor against a determined attacker with a realistic mask or a compromised device, and no camera-only check can. The TOTP secrets themselves remain AES-GCM encrypted by the Android Keystore. If you forget both your face and your backup PIN, there is no recovery path; reinstall the app to start over, which also deletes the saved accounts.
+This is still a **camera-only check, not certified biometrics**: it is built so that photographs, printed cut-outs, and replayed videos fail, but it cannot match a dedicated infrared/depth sensor against a determined attacker with a realistic mask or a compromised device, and no camera-only check can. The TOTP secrets themselves remain AES-GCM encrypted by the Android Keystore. Deleting the PIN after repeated invalid scans is deliberately fail-closed: the templates stay, so a live scan still unlocks the app and the owner can set a new PIN afterwards, but until that scan succeeds there is no PIN fallback. If you lose both your face and your backup PIN, there is no recovery path; reinstall the app to start over, which also deletes the saved accounts.
 
 A front-facing camera is required for initial setup. The app asks for camera permission when you register your face or scan a QR code; no storage or network permission is requested. Changing face registration or the backup PIN is only possible after the app has been unlocked.
 
@@ -36,7 +39,7 @@ A front-facing camera is required for initial setup. The app asks for camera per
 
 Unlocking the app does **not** expose the verification codes. Every account card shows bullets in place of its digits and a crossed-out eye with a small padlock. Tapping the locked eye—or the card itself—opens the same on-device face screen in a dedicated reveal mode. A live camera frame must match the enrolled face descriptors before the current code is drawn. The eye then becomes an open eye, and tapping it again hides the code immediately.
 
-A successful reveal lasts at most 30 seconds. It is also cleared as soon as the activity pauses (another app, screen off, the recents screen, a lock, or process death), so the next reveal always needs another face scan. Copying is blocked while the code is hidden. The backup PIN created during enrollment can be used instead of a face scan if the camera is unavailable or the scan keeps failing.
+A successful reveal lasts at most 30 seconds. It is also cleared as soon as the activity pauses (another app, screen off, the recents screen, a lock, or process death), so the next reveal always needs another face scan. Copying is blocked while the code is hidden. The backup PIN created during enrollment can be used instead of a face scan if the camera is unavailable or the scan keeps failing, unless the invalid-scan limit above has removed it.
 
 ## Demo QR code (test setup)
 
@@ -56,13 +59,22 @@ Open this project in Android Studio, or use Gradle 8.10.2+ with Android SDK Plat
 gradle assembleDebug
 ```
 
-A dependency-free manual build script is also included. It requires `javac`, `aapt2`, `d8`, `apksigner`, `zipalign`, `zip`, `python3`, and an API 35 `android.jar`; set `ANDROID_HOME`/`ANDROID_SDK_ROOT` or `ANDROID_JAR`, `AAPT2`, `D8`, and `APKSIGNER` as needed:
+A dependency-free manual build script is also included. With an Android SDK it uses `javac`, `aapt2`, `d8`, `apksigner` and `zipalign`; set `ANDROID_HOME`/`ANDROID_SDK_ROOT`, or `ANDROID_JAR`, `AAPT2`, `D8_JAR`/`D8`, `APKSIGNER_JAR`/`APKSIGNER` and `ZIPALIGN` explicitly:
 
 ```sh
 ./build.sh
 ```
 
-The resulting APK is `Authenticator.apk` (version 1.3.0), which hardens the face check with randomised liveness challenges and a fully responsive, edge-to-edge scan screen. The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
+On a machine without an SDK, `tools/fetch_toolchain.sh` downloads a pinned, checksum-verified JRE (jdk4py), the Eclipse batch compiler, D8, aapt2 and an `android.jar` into the git-ignored `build/toolchain`; `build.sh` sources the generated `env.sh` automatically:
+
+```sh
+./tools/fetch_toolchain.sh
+./build.sh
+```
+
+Without SDK `zipalign`/`apksigner`, the build falls back to the repository's dependency-free `tools/zipalign.py` and `tools/apk_sign.py`. `zip` and `python3` are always required.
+
+The resulting APK is `Authenticator.apk` (version 1.4.0). This release makes face detection more reliable by locking one detector-aligned crop per attempt, asks the user to show their face when none is visible, and deletes the backup PIN after more than 20 consecutive invalid face scans. The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
 
 ### Signing identity
 
@@ -111,7 +123,13 @@ entries that are not 4-byte aligned, a v1 signature that does not cover the
 actual entry contents, **a v2/v3 content digest that does not match the bytes
 of the file**, **a v2/v3 signature that is not a valid RSA signature by the
 certificate in the block**, and an APK that is not signed with the certificate
-in `tools/debug_cert.pem`.
+in `tools/debug_cert.pem`. It also requires the v3 signer to apply to API 24
+(Android 7.0) or newer and to declare the same SDK range in the signer and in
+its signed data. apksigner emits `max(minSdkVersion, 24)`; a v3 block that
+starts at API 23 is rejected by apksigner with `No supported signatures` and
+cannot be used by Android 9.0+, even when its digest and RSA signature are
+valid. That rule is checked here because the older signer in `tools/apk_sign.py`
+used to copy the APK's API 23 minimum straight into the v3 block.
 
 Both of the bolded checks are needed, because the two failure modes are
 opposite. The APK this project shipped before this fix was signed and then its
@@ -163,9 +181,10 @@ These check packaging, the consistency of the signature with the file
 contents, and the signature itself: the v2/v3 signature bytes are verified as
 RSASSA-PKCS1-v1_5 signatures by the certificate in the signing block, so a
 corrupted or fabricated signature is rejected even when the content digest it
-quotes is correct. `build.sh` additionally uses
-`apksigner verify --min-sdk-version 23` to verify the signatures
-cryptographically.
+quotes is correct. When an Android SDK (`apksigner`) is available, `build.sh`
+additionally runs `apksigner verify --min-sdk-version 23` to verify the
+signatures cryptographically; without one it still runs the Python checks
+above, which implement the same RSA verification.
 
 `tools/apk_sign.py` is a dependency-free signer (v1 + v2 + v3) used to
 reproduce and repair the checked-in APK when no Android SDK is available:
@@ -176,9 +195,11 @@ python3 tools/apk_sign.py --key tools/debug_key.pem --cert tools/debug_cert.pem 
 ```
 
 It re-aligns every entry to 4 bytes and regenerates all three signature
-schemes. Prefer `apksigner` for real releases; this tool exists so that the
-signature of the checked-in artifact can be produced and verified with
-nothing but Python.
+schemes, clamping the v3 signer's SDK range to API 24 or newer so Android 9+
+accepts it. `tools/zipalign.py` is the matching aligner/verifier
+(`-f 4 in.apk out.apk`, `-c 4 in.apk`). Prefer the SDK tools for real releases;
+these exist so that the checked-in artifact can be built, aligned, signed and
+verified with nothing but Python.
 
 
 The dependency-free RFC 6238 regression vectors are in `tests/TotpVectors.java`, the custom face descriptor checks are in `tests/FaceTemplateVectors.java`, and the anti-spoofing session checks (a synthetic face driven through the randomised prompts, plus static-photo, rigid-photo, screen-replay, impostor, and no-light-response attacks) are in `tests/LivenessVectors.java`. After running `./build.sh`, run them with a JDK using the compiled app classes on the classpath:
@@ -192,14 +213,27 @@ java -cp build/manual/classes:build/test-classes FaceTemplateVectors
 java -cp build/manual/classes:build/test-classes LivenessVectors
 ```
 
+With no JDK, use the JRE and Eclipse compiler from `tools/fetch_toolchain.sh`:
+
+```sh
+JAVA=build/toolchain/jdk4py/jdk4py/java-runtime/bin/java
+$JAVA -cp build/toolchain/ecj.jar org.eclipse.jdt.internal.compiler.batch.Main \
+  -source 8 -target 8 -classpath build/manual/classes \
+  -d build/test-classes tests/TotpVectors.java tests/FaceTemplateVectors.java \
+  tests/LivenessVectors.java
+$JAVA -cp build/manual/classes:build/test-classes TotpVectors
+$JAVA -cp build/manual/classes:build/test-classes FaceTemplateVectors
+$JAVA -cp build/manual/classes:build/test-classes LivenessVectors
+```
+
 ## Credits and technology used
 
 The face unlock and per-code reveal gate are implemented from first principles on top of the Android platform. No third-party face-recognition SDK, pre-trained ML model, cloud service, fingerprint sensor, Android `BiometricPrompt`, or Google Play Services is used.
 
 - **Android Camera API** (`android.hardware.Camera`) supplies the front-camera NV21 preview frames used for enrollment and for every unlock/reveal check, and the platform **`android.media.FaceDetector`** vouches for face presence (exactly one face) on top of the app's own landmark geometry.
-- **Custom face descriptor** (`FaceTemplate.java`)—a 48×48 illumination-normalised face crop, a 6×6 grid of 8-bin histograms of oriented gradients, and a 24×24 low-frequency thumbnail. Matching uses cosine similarity with a ±1-cell/±1-pixel shift search; the final confirmation additionally requires both components to clear independent floors.
-- **Custom liveness engine** (`FaceSignals.java`, `LivenessSession.java`)—centre-surround eye localisation on a 96×96 crop, blink-openness and brow-jump detection, mouth/eye parallax, screen-moiré periodicity analysis, randomised screen-flash light response, and a pure-Java challenge–response state machine that fuses all of it with identity on every frame.
-- **Android Keystore with AES-256-GCM** (`FaceStore.java`)—the face descriptors and backup-PIN hash are encrypted at rest with a non-exportable key generated inside the Android Keystore.
+- **Custom face descriptor** (`FaceTemplate.java`)—a detector-aligned 48×48 illumination-normalised face crop, a 6×6 grid of 8-bin histograms of oriented gradients, and a 24×24 low-frequency thumbnail. The crop centre and size are chosen once per attempt from the detected eye pair, so the same face scale is compared whether the phone is close or far away. Matching uses cosine similarity with a ±1-cell/±1-pixel shift search; the final confirmation additionally requires both components to clear independent floors.
+- **Custom liveness engine** (`FaceSignals.java`, `LivenessSession.java`)—centre-surround eye localisation on a 96×96 crop taken from the same locked crop as the descriptor, blink-openness and brow-jump detection, mouth/eye parallax, screen-moiré periodicity analysis, randomised screen-flash light response, and a pure-Java challenge–response state machine that fuses all of it with identity on every frame.
+- **Android Keystore with AES-256-GCM** (`FaceStore.java`)—the face descriptors and backup-PIN hash are encrypted at rest with a non-exportable key generated inside the Android Keystore. The same class persists the consecutive-invalid-scan count and deletes only the PIN hash/salt once more than `MAX_INVALID_SCANS` (20) scans fail, leaving the encrypted templates in place.
 - **PBKDF2-HMAC-SHA1**—60,000-iteration backup-PIN hashing with a random salt, plus persisted attempt throttling.
 - **ZXing Core 3.5.3**—QR-code decoding. Licensed under Apache 2.0; see [`ZXING-LICENSE.txt`](ZXING-LICENSE.txt) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 - **RFC 4226 / RFC 6238**—HOTP/TOTP code generation in `Totp.java`.

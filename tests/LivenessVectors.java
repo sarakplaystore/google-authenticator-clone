@@ -103,6 +103,15 @@ public final class LivenessVectors {
     require(open.geometryLooksLikeFace(), "straight face failed geometry check");
     require(open.moireScore < 0.15f, "clean face moire too high: " + open.moireScore);
 
+    // Same face, detector-framed crop (3.2x eye distance, centred just below
+    // the eye pair). All landmark windows must still lock onto the face.
+    FaceSignals guided = FaceSignals.fromFrame(synth(new Pose()), W, H, 0,
+        0.5f, 0.4f, 0.613333f);
+    require(guided != null, "guided-crop signals were null");
+    require(guided.eyesFound && guided.mouthFound,
+        "guided-crop landmarks not found");
+    require(guided.geometryLooksLikeFace(), "guided crop failed geometry check");
+
     Pose closed = new Pose();
     closed.closed = 1f;
     FaceSignals shut = signals(closed);

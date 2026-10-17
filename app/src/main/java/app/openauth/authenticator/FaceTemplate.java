@@ -45,16 +45,36 @@ public final class FaceTemplate {
     this.quality = quality;
   }
 
+  /** Default crop position, as a fraction of the upright frame. */
+  public static final float DEFAULT_CENTER_X = 0.5f;
+  public static final float DEFAULT_CENTER_Y = 0.36f;
+  /** Default crop side, as a fraction of the shorter upright frame side. */
+  public static final float DEFAULT_SIDE = 0.72f;
+
   /**
    * Builds a descriptor from an NV21 preview frame. The crop is taken from the
    * middle of the upright frame. Returns {@code null} when the buffer is not a
    * usable camera frame.
    */
   public static FaceTemplate fromFrame(byte[] nv21, int width, int height, int rotation) {
+    return fromFrame(nv21, width, height, rotation,
+        DEFAULT_CENTER_X, DEFAULT_CENTER_Y, DEFAULT_SIDE);
+  }
+
+  /**
+   * Builds a descriptor from a face-aligned crop. {@code centerX} and
+   * {@code centerY} are fractions of the upright frame width and height;
+   * {@code sideFraction} is the crop side relative to the shorter upright
+   * side. The activity locks one such crop for a whole scan so that head
+   * movement stays measurable instead of being followed by the crop.
+   */
+  public static FaceTemplate fromFrame(byte[] nv21, int width, int height, int rotation,
+      float centerX, float centerY, float sideFraction) {
     if (nv21 == null || width < 64 || height < 64 || nv21.length < width * height) {
       return null;
     }
-    float[] gray = sampleFace(nv21, width, height, rotation);
+    float[] gray = sampleFace(nv21, width, height, rotation,
+        centerX, centerY, sideFraction);
     if (gray == null) {
       return null;
     }
@@ -195,18 +215,32 @@ public final class FaceTemplate {
     return new FaceTemplate(hog, thumb, 1f);
   }
 
-  private static float[] sampleFace(byte[] frame, int width, int height, int rotation) {
-    return sampleFaceSized(frame, width, height, rotation, SIZE);
+  private static float[] sampleFace(byte[] frame, int width, int height, int rotation,
+      float centerX, float centerY, float sideFraction) {
+    return sampleFaceSized(frame, width, height, rotation, SIZE,
+        centerX, centerY, sideFraction);
   }
 
   /**
-   * Samples the centred face crop at an arbitrary resolution. Shared with
+   * Samples a face crop at an arbitrary resolution. Shared with
    * {@link FaceSignals}, which needs a larger crop than the descriptor for
    * reliable eye and mouth localisation. Returns a square grayscale image of
    * {@code size}x{@code size}, or {@code null} for an unusable buffer.
+   *
+   * <p>With the default crop ({@link #DEFAULT_CENTER_X}, {@link
+   * #DEFAULT_CENTER_Y}, {@link #DEFAULT_SIDE}) the sample coordinates are the
+   * same as the original fixed centre crop, so older registrations and the
+   * synthetic regression vectors keep working unchanged.</p>
    */
   static float[] sampleFaceSized(byte[] frame, int width, int height, int rotation,
       int size) {
+    return sampleFaceSized(frame, width, height, rotation, size,
+        DEFAULT_CENTER_X, DEFAULT_CENTER_Y, DEFAULT_SIDE);
+  }
+
+  /** Crops a face with an explicit centre and side; see {@link #sampleFaceSized}. */
+  static float[] sampleFaceSized(byte[] frame, int width, int height, int rotation,
+      int size, float centerX, float centerY, float sideFraction) {
     if (frame == null || width < 64 || height < 64 || frame.length < width * height
         || size < 8) {
       return null;
@@ -214,9 +248,9 @@ public final class FaceTemplate {
     int r = ((rotation % 360) + 360) % 360;
     int uprightWidth = (r == 90 || r == 270) ? height : width;
     int uprightHeight = (r == 90 || r == 270) ? width : height;
-    float side = Math.min(uprightWidth, uprightHeight) * 0.72f;
-    float left = uprightWidth / 2f - side / 2f;
-    float top = uprightHeight * 0.36f - side / 2f;
+    float side = Math.min(uprightWidth, uprightHeight) * clamp(sideFraction, 0.20f, 1.40f);
+    float left = clamp(centerX, 0f, 1f) * uprightWidth - side / 2f;
+    float top = clamp(centerY, 0f, 1f) * uprightHeight - side / 2f;
     float step = side / size;
 
     float[] gray = new float[size * size];
@@ -348,6 +382,10 @@ public final class FaceTemplate {
     }
     l2Normalize(thumb);
     return thumb;
+  }
+
+  private static float clamp(float value, float min, float max) {
+    return Math.max(min, Math.min(max, value));
   }
 
   private static void l2Normalize(float[] values) {
