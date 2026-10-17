@@ -7,3 +7,5 @@ app/build/
 *.keystore
 *.jks
 .DS_Store
+.venv/
+__pycache__/

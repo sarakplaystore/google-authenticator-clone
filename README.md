@@ -49,7 +49,7 @@ Open this project in Android Studio, or use Gradle 8.10.2+ with Android SDK Plat
 gradle assembleDebug
 ```
 
-A dependency-free manual build script is also included. It requires `javac`, `aapt2`, `d8`, `apksigner`, `zip`, and an API 35 `android.jar`; set `ANDROID_HOME`/`ANDROID_SDK_ROOT` or `ANDROID_JAR`, `AAPT2`, `D8`, and `APKSIGNER` as needed:
+A dependency-free manual build script is also included. It requires `javac`, `aapt2`, `d8`, `apksigner`, `zipalign`, `zip`, `python3`, and an API 35 `android.jar`; set `ANDROID_HOME`/`ANDROID_SDK_ROOT` or `ANDROID_JAR`, `AAPT2`, `D8`, and `APKSIGNER` as needed:
 
 ```sh
 ./build.sh
@@ -57,7 +57,44 @@ A dependency-free manual build script is also included. It requires `javac`, `aa
 
 The resulting APK is `Authenticator.apk` (version 1.2.0), which adds the per-code face-check reveal gate. The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. Because a local build generates a fresh debug key by default, Android may refuse to update an earlier debug build in place; uninstalling it first also removes its saved accounts and enrolled face. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
 
+## Android 6.0+ installation compatibility
+
+The minimum supported version is **Android 6.0 (API 23)**; target SDK 35 does
+not mean Android 15 is required. The manual build explicitly enables v1 signing
+(required by Android 6), verifies signatures starting at API 23, and requires
+ZIP alignment. A packaging check rejects newer DEX formats, missing v1 signing
+entries, and compressed or unaligned resource tables. Gradle debug builds also
+explicitly enable v1 signing. Release signing configurations must enable it too.
+
+If installation still fails, capture the exact error (or use
+`adb install -r Authenticator.apk` from a computer):
+
+- `INSTALL_FAILED_UPDATE_INCOMPATIBLE`: the installed app uses a different
+  signing key. Rebuild with the original keystore to update without losing data.
+  **Do not uninstall or clear app data unless you have recovery codes or setup
+  keys for every account**; doing so destroys the locally stored accounts.
+- `INSTALL_FAILED_VERSION_DOWNGRADE`: install a build with a version code at
+  least as high as the installed version.
+- `INSTALL_FAILED_OLDER_SDK`: confirm the phone runs Android 6.0 or newer and
+  that you are installing this project's APK, not another download.
+- For blocked sideloads, allow installation from the app opening the APK
+  (on Android 6/7, use Settings → Security → Unknown sources).
+
+An actual device/emulator install is still needed to confirm device-specific
+compatibility; packaging checks alone cannot establish why an installation failed.
+
 ## Tests
+
+Run the APK packaging checks and their regression tests without an Android SDK:
+
+```sh
+python3 tests/check_apk_compatibility.py Authenticator.apk
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+These check packaging, not signature authenticity; `build.sh` also uses
+`apksigner verify --min-sdk-version 23` to verify the signatures cryptographically.
+
 
 The dependency-free RFC 6238 regression vectors are in `tests/TotpVectors.java`, and the custom face descriptor checks are in `tests/FaceTemplateVectors.java`. After running `./build.sh`, run them with a JDK using the compiled app classes on the classpath:
 

@@ -62,6 +62,8 @@ if [[ -z "${ZIPALIGN:-}" ]]; then
   ZIPALIGN="$(find_build_tool zipalign || command -v zipalign || true)"
 fi
 
+[[ -n "${ZIPALIGN:-}" && -x "$ZIPALIGN" ]] || fail "zipalign is required; set ZIPALIGN or install Android SDK build-tools."
+
 if [[ -n "${JAVAC:-}" ]]; then
   JAVAC_CMD=("$JAVAC")
 elif command -v javac >/dev/null 2>&1; then
@@ -114,6 +116,7 @@ elif command -v keytool >/dev/null 2>&1; then
 else
   fail "keytool not found; install a JDK."
 fi
+command -v python3 >/dev/null 2>&1 || fail "python3 is required to check APK compatibility."
 command -v zip >/dev/null 2>&1 || fail "zip is required to package classes.dex."
 
 mkdir -p "$BUILD_DIR/classes" "$BUILD_DIR/generated" "$BUILD_DIR/dex" "$(dirname "$OUTPUT_APK")"
@@ -163,10 +166,8 @@ cp "$BUILD_DIR/base.apk" "$BUILD_DIR/unsigned.apk"
 )
 
 APK_TO_SIGN="$BUILD_DIR/unsigned.apk"
-if [[ -n "${ZIPALIGN:-}" && -x "$ZIPALIGN" ]]; then
-  "$ZIPALIGN" -f 4 "$APK_TO_SIGN" "$BUILD_DIR/aligned.apk"
-  APK_TO_SIGN="$BUILD_DIR/aligned.apk"
-fi
+"$ZIPALIGN" -f 4 "$APK_TO_SIGN" "$BUILD_DIR/aligned.apk"
+APK_TO_SIGN="$BUILD_DIR/aligned.apk"
 
 KEYSTORE="${KEYSTORE:-$BUILD_DIR/debug.keystore}"
 if [[ ! -f "$KEYSTORE" ]]; then
@@ -180,10 +181,18 @@ fi
 "${SIGN_CMD[@]}" sign \
   --ks "$KEYSTORE" --ks-key-alias authenticator-debug \
   --ks-pass pass:android --key-pass pass:android \
+  --min-sdk-version 23 \
+  --v1-signing-enabled true \
+  --v2-signing-enabled true \
+  --v3-signing-enabled true \
   --v4-signing-enabled false \
   --out "$OUTPUT_APK" "$APK_TO_SIGN"
 rm -f "$OUTPUT_APK.idsig"
-"${SIGN_CMD[@]}" verify --verbose "$OUTPUT_APK"
+# Android 6 only understands JAR (v1) signatures. Verify starting at API 23,
+# not just on a recent Android version that accepts the v2/v3 signing block.
+"${SIGN_CMD[@]}" verify --verbose --min-sdk-version 23 "$OUTPUT_APK"
+"$ZIPALIGN" -c 4 "$OUTPUT_APK"
+python3 "$ROOT/tests/check_apk_compatibility.py" "$OUTPUT_APK"
 printf '\nBuilt APK: %s\n' "$OUTPUT_APK"
 printf 'Package: app.openauth.authenticator | min SDK: 23 | target SDK: 35\n'
 printf 'Note: this APK is debug-signed for local testing/sideloading.\n'
