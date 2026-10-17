@@ -8,23 +8,20 @@ An independent, offline-first Android authenticator for standard time-based one-
 - Add accounts by scanning a standard `otpauth://totp/...` QR code or entering the Base32 setup key.
 - Automatically refresh codes and show the remaining time.
 - Search, rename, remove, and copy account codes.
-- Encrypt account data with AES-GCM using the Android Keystore; Android backup is disabled.
-- Lock the code list with a face unlock that the app checks itself, on the device, with the front camera.
-- Work entirely offline. The app requests camera permission only when scanning a QR code or when a face unlock is used.
+- Require a custom, on-device face registration before the account list is shown. Setup takes three front-camera samples and creates a six-digit backup PIN.
+- Unlock with the front camera on every app open. The app does **not** use Android's biometric prompt, fingerprint sensors, Touch ID, or the device's built-in face unlock, and it does not request biometric permissions.
+- Encrypt account data with AES-GCM using the Android Keystore; Android backup is disabled. Face descriptors and the PIN hash are separately encrypted with the Keystore.
+- Work entirely offline. Camera permission is used to register/unlock with your face and to scan QR codes. Screenshots and the recents preview are blocked with `FLAG_SECURE` while the app is open.
+
+Google migration/transfer QR codes, HOTP accounts, cloud sync, and account export are not supported. Keep a secure copy of each service's recovery codes before moving or uninstalling the app. Reinstalling the app removes its local Keystore key and saved accounts.
 
 ## Face unlock
 
-The app can ask for your face before it shows any code. The setting lives in *Settings → Face unlock* and works like this:
+The first time the app opens it requires face registration. Three guided front-camera samples are reduced to numeric descriptors, encrypted with a key in the Android Keystore, and stored only on the device. Camera images are never written to storage. A six-digit backup PIN is created at the same time and can be used if a scan fails in poor light or with different eyewear.
 
-- The front camera takes a few pictures of your face while you centre it in the frame.
-- Each picture is reduced to a short description of the face: a contrast-normalised intensity grid, gradient histograms and a coarse map of the proportions. The pictures themselves are never stored.
-- The descriptions are encrypted with AES-GCM using the Android Keystore and stay on the device.
-- Every time the app is opened, the camera picture is described the same way and compared with the stored descriptions on the device. Two matching pictures in a row unlock the app.
-- The app locks again when it has been in the background for a while. The delay is configurable in *Settings → Lock again after*.
+The lock is a **convenience gate, not security-grade biometrics**. It is implemented independently of the system biometric stack and is more easily spoofed than a dedicated biometric sensor (for example, with a photograph). The TOTP secrets themselves remain AES-GCM encrypted by the Android Keystore. If you forget both your face and your backup PIN, there is no recovery path; reinstall the app to start over, which also deletes the saved accounts.
 
-The face recognition of Android is not used, no network connection is made and nothing leaves the device. If the camera is not available or the face is not recognised, the app offers the PIN, pattern or password of the device as a fallback, and the face lock can be turned off again from the lock screen. The matching threshold and the behaviour of the descriptor are covered by `tests/FaceTemplateVectors.java`.
-
-Google migration/transfer QR codes, HOTP accounts, cloud sync, and account export are not supported. Keep a secure copy of each service's recovery codes before moving or uninstalling the app. Reinstalling the app removes its local Keystore key and saved accounts.
+A front-facing camera is required for initial setup. The app asks for camera permission when you register your face or scan a QR code; no storage or network permission is requested. Changing face registration or the backup PIN is only possible after the app has been unlocked.
 
 ## Build
 
@@ -40,19 +37,20 @@ A dependency-free manual build script is also included. It requires `javac`, `aa
 ./build.sh
 ```
 
-The resulting APK is `Authenticator.apk`. The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. The debug key is generated on the machine that builds the APK, so an APK that was built elsewhere carries a different signature: uninstall the earlier build before sideloading this one, otherwise Android refuses the update. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
+The resulting APK is `Authenticator.apk` (version 1.1.0). The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. Because a local build generates a fresh debug key by default, Android may refuse to update an earlier debug build in place; uninstalling it first also removes its saved accounts and enrolled face. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
 
 ## Tests
 
-The dependency-free RFC 6238 regression vectors are in `tests/TotpVectors.java`, the face matching checks are in `tests/FaceTemplateVectors.java`. After running `./build.sh`, run them with a JDK using the compiled app classes on the classpath:
+The dependency-free RFC 6238 regression vectors are in `tests/TotpVectors.java`, and the custom face descriptor checks are in `tests/FaceTemplateVectors.java`. After running `./build.sh`, run them with a JDK using the compiled app classes on the classpath:
 
 ```sh
 mkdir -p build/test-classes
-javac -cp build/manual/classes -d build/test-classes tests/TotpVectors.java tests/FaceTemplateVectors.java
+javac -cp build/manual/classes -d build/test-classes \
+  tests/TotpVectors.java tests/FaceTemplateVectors.java
 java -cp build/manual/classes:build/test-classes TotpVectors
 java -cp build/manual/classes:build/test-classes FaceTemplateVectors
 ```
 
 ## Implementation and license
 
-The TOTP implementation follows RFC 4226 and RFC 6238. The face unlock is implemented in this repository without any machine learning library, using the camera and a descriptor that is described in `app/src/main/java/app/openauth/authenticator/FaceTemplate.java`. QR decoding uses ZXing Core 3.5.3, whose Apache 2.0 license is included in [`ZXING-LICENSE.txt`](ZXING-LICENSE.txt). See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+The TOTP implementation follows RFC 4226 and RFC 6238. QR decoding uses ZXing Core 3.5.3, whose Apache 2.0 license is included in [`ZXING-LICENSE.txt`](ZXING-LICENSE.txt). See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

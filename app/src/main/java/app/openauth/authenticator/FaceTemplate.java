@@ -1,333 +1,369 @@
 package app.openauth.authenticator;
 
 /**
- * Compact on-device descriptor of a face region.
+ * A small, self-contained face descriptor computed from a front-camera frame.
  *
- * <p>The descriptor is built from camera luminance frames and has three blocks:
- *
- * <ul>
- *   <li>a contrast-normalised {@value #GRID}x{@value #GRID} intensity grid, which keeps the
- *       overall shape of the face;</li>
- *   <li>a {@value #CELL_COUNT}x{@value #CELL_COUNT} grid of {@value #BIN_COUNT}-bin signed
- *       gradient histograms, which keeps the direction of the edges around the eyes, nose
- *       and mouth;</li>
- *   <li>a coarse map of the mean brightness of every cell, which keeps the proportions of
- *       the face.</li>
- * </ul>
- *
- * <p>Every block is scaled to unit length, so the cosine similarity of two descriptors is
- * the average similarity of the three blocks. No Android APIs are used here so that the
- * matching behaviour can be regression tested on a desktop JVM, see
- * {@code tests/FaceTemplateVectors.java}.
+ * <p>The descriptor combines an illumination-normalised thumbnail with a small
+ * histogram-of-oriented-gradients grid. It is deliberately dependency-free so
+ * that it can be unit tested on a plain JVM. No frame or image is ever stored;
+ * only the numeric descriptor is kept, encrypted by {@link FaceStore}.</p>
  */
 public final class FaceTemplate {
-  /** Resolution of the intensity grid. */
-  public static final int GRID = 40;
-  /** Number of cells per side of the gradient histogram grid. */
-  public static final int CELL_COUNT = 10;
-  /** Number of orientation bins per cell. */
-  public static final int BIN_COUNT = 8;
-  /** Length of the intensity block. */
-  public static final int INTENSITY_LENGTH = GRID * GRID;
-  /** Length of the gradient histogram block. */
-  public static final int SHAPE_LENGTH = CELL_COUNT * CELL_COUNT * BIN_COUNT;
-  /** Length of the coarse brightness block. */
-  public static final int COARSE_LENGTH = CELL_COUNT * CELL_COUNT;
-  /** Length of a complete descriptor. */
-  public static final int LENGTH = INTENSITY_LENGTH + SHAPE_LENGTH + COARSE_LENGTH;
-  /** Largest alignment offset, in grid cells, that is compensated while matching. */
-  public static final int SHIFT_LIMIT = 3;
+  /** Side of the normalised face crop used for feature extraction. */
+  public static final int SIZE = 48;
+  public static final int GRID = 6;
+  public static final int BINS = 8;
+  public static final int THUMB = 24;
+  public static final int HOG_LENGTH = GRID * GRID * BINS;
+  public static final int THUMB_LENGTH = THUMB * THUMB;
+  public static final int BYTE_LENGTH = 4 + (HOG_LENGTH + THUMB_LENGTH) * 4;
 
-  private FaceTemplate() {}
+  /** A frame must reach this score on two consecutive reads before unlocking. */
+  public static final float MATCH_THRESHOLD = 0.78f;
+  /** Minimum usable quality; darker or flatter frames are rejected. */
+  public static final float MIN_QUALITY = 0.36f;
+
+  private static final int SERIAL_VERSION = 1;
+  private static final float ELLIPSE_FEATHER = 4.0f;
+
+  private final float[] hog;
+  private final float[] thumb;
+  private final float quality;
+
+  private FaceTemplate(float[] hog, float[] thumb, float quality) {
+    this.hog = hog;
+    this.thumb = thumb;
+    this.quality = quality;
+  }
 
   /**
-   * Averages the given frame region down to a {@value #GRID}x{@value #GRID} grid of mean
-   * luminance values.
-   *
-   * @param luminance frame luminance plane, row major, one byte per pixel
-   * @param width frame width in pixels
-   * @param height frame height in pixels
-   * @param left region left edge, inclusive
-   * @param top region top edge, inclusive
-   * @param right region right edge, exclusive
-   * @param bottom region bottom edge, exclusive
-   * @return {@value #GRID}*{@value #GRID} mean luminance values
+   * Builds a descriptor from an NV21 preview frame. The crop is taken from the
+   * middle of the upright frame. Returns {@code null} when the buffer is not a
+   * usable camera frame.
    */
-  public static float[] downsample(byte[] luminance, int width, int height,
-      int left, int top, int right, int bottom) {
-    float[] grid = new float[GRID * GRID];
-    int regionWidth = Math.max(1, right - left);
-    int regionHeight = Math.max(1, bottom - top);
-    for (int cellY = 0; cellY < GRID; cellY++) {
-      int y0 = top + regionHeight * cellY / GRID;
-      int y1 = top + regionHeight * (cellY + 1) / GRID;
-      if (y1 <= y0) y1 = y0 + 1;
-      for (int cellX = 0; cellX < GRID; cellX++) {
-        int x0 = left + regionWidth * cellX / GRID;
-        int x1 = left + regionWidth * (cellX + 1) / GRID;
-        if (x1 <= x0) x1 = x0 + 1;
+  public static FaceTemplate fromFrame(byte[] nv21, int width, int height, int rotation) {
+    if (nv21 == null || width < 64 || height < 64 || nv21.length < width * height) {
+      return null;
+    }
+    float[] gray = sampleFace(nv21, width, height, rotation);
+    if (gray == null) {
+      return null;
+    }
+    return fromGray(gray);
+  }
+
+  /** Builds a descriptor from a square, upright grayscale crop. Used by tests. */
+  static FaceTemplate fromGray(float[] gray) {
+    if (gray == null || gray.length != SIZE * SIZE) {
+      return null;
+    }
+
+    float[] mask = ellipseMask();
+    double weightSum = 0.0;
+    double mean = 0.0;
+    for (int i = 0; i < gray.length; i++) {
+      if (mask[i] > 0f) {
+        weightSum += mask[i];
+        mean += gray[i] * mask[i];
+      }
+    }
+    if (weightSum < 1.0) {
+      return null;
+    }
+    mean /= weightSum;
+
+    double variance = 0.0;
+    for (int i = 0; i < gray.length; i++) {
+      if (mask[i] > 0f) {
+        double delta = gray[i] - mean;
+        variance += delta * delta * mask[i];
+      }
+    }
+    variance /= weightSum;
+    float std = (float) Math.sqrt(Math.max(0.0, variance));
+
+    float quality = Math.min(1f, std / 48f);
+    if (mean < 24.0 || mean > 236.0) {
+      quality *= 0.45f;
+    }
+    if (std < 5.0f) {
+      quality = 0f;
+    }
+
+    // Normalise illumination inside the elliptical face region, then soften
+    // camera noise before measuring gradients.
+    float[] normalized = new float[gray.length];
+    float divisor = Math.max(std, 1.0f);
+    for (int i = 0; i < gray.length; i++) {
+      float value = mask[i] > 0f ? (gray[i] - (float) mean) / divisor : 0f;
+      normalized[i] = Math.max(-3f, Math.min(3f, value));
+    }
+    float[] blurred = blur3x3(normalized);
+
+    float[] hog = histogramOfGradients(blurred, mask);
+    float[] thumb = thumbnail(blurred, mask);
+    return new FaceTemplate(hog, thumb, quality);
+  }
+
+  public boolean isUsable() {
+    return quality >= MIN_QUALITY;
+  }
+
+  public float getQuality() {
+    return quality;
+  }
+
+  /**
+   * Compares this descriptor with a stored one. Small ±1-cell / ±1-pixel shifts
+   * are searched so that minor head movement does not cause a false rejection.
+   * The result is between 0 and 1; higher is more similar.
+   */
+  public float similarity(FaceTemplate other) {
+    float[] scores = componentScores(other);
+    return Math.max(0f, Math.min(1f, 0.55f * scores[0] + 0.45f * scores[1]));
+  }
+
+  /** Package-private components for calibration tests: {gradient, thumbnail}. */
+  float[] componentScores(FaceTemplate other) {
+    if (other == null) return new float[] {0f, 0f};
+    float hogScore = Math.max(0f, cosineShift(hog, other.hog, GRID, GRID, BINS, 0, 0));
+    float bestThumb = 0f;
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        float score = cosineShift(thumb, other.thumb, THUMB, THUMB, 1, dx, dy);
+        score *= 1f - 0.01f * (Math.abs(dx) + Math.abs(dy));
+        if (score > bestThumb) bestThumb = score;
+      }
+    }
+    return new float[] {hogScore, bestThumb};
+  }
+
+  /** Serialises the numeric descriptor for encrypted-at-rest storage. */
+  public byte[] toBytes() {
+    byte[] result = new byte[BYTE_LENGTH];
+    writeInt(result, 0, SERIAL_VERSION);
+    int offset = 4;
+    for (float value : hog) {
+      writeInt(result, offset, Float.floatToIntBits(value));
+      offset += 4;
+    }
+    for (float value : thumb) {
+      writeInt(result, offset, Float.floatToIntBits(value));
+      offset += 4;
+    }
+    return result;
+  }
+
+  public static FaceTemplate fromBytes(byte[] data) {
+    if (data == null || data.length != BYTE_LENGTH || readInt(data, 0) != SERIAL_VERSION) {
+      return null;
+    }
+    float[] hog = new float[HOG_LENGTH];
+    float[] thumb = new float[THUMB_LENGTH];
+    int offset = 4;
+    for (int i = 0; i < hog.length; i++) {
+      hog[i] = Float.intBitsToFloat(readInt(data, offset));
+      offset += 4;
+    }
+    for (int i = 0; i < thumb.length; i++) {
+      thumb[i] = Float.intBitsToFloat(readInt(data, offset));
+      offset += 4;
+    }
+    return new FaceTemplate(hog, thumb, 1f);
+  }
+
+  private static float[] sampleFace(byte[] frame, int width, int height, int rotation) {
+    int r = ((rotation % 360) + 360) % 360;
+    int uprightWidth = (r == 90 || r == 270) ? height : width;
+    int uprightHeight = (r == 90 || r == 270) ? width : height;
+    float side = Math.min(uprightWidth, uprightHeight) * 0.72f;
+    float left = uprightWidth / 2f - side / 2f;
+    float top = uprightHeight * 0.36f - side / 2f;
+    float step = side / SIZE;
+
+    float[] gray = new float[SIZE * SIZE];
+    for (int y = 0; y < SIZE; y++) {
+      for (int x = 0; x < SIZE; x++) {
         float sum = 0f;
         int count = 0;
-        for (int y = y0; y < y1 && y < height; y++) {
-          int row = y * width;
-          for (int x = x0; x < x1 && x < width; x++) {
-            sum += luminance[row + x] & 0xff;
-            count++;
+        for (int sy = 0; sy < 3; sy++) {
+          for (int sx = 0; sx < 3; sx++) {
+            float ux = left + (x + (sx + 0.5f) / 3f) * step;
+            float uy = top + (y + (sy + 0.5f) / 3f) * step;
+            int sourceX;
+            int sourceY;
+            if (r == 90) {
+              sourceX = (int) uy;
+              sourceY = height - 1 - (int) ux;
+            } else if (r == 180) {
+              sourceX = width - 1 - (int) ux;
+              sourceY = height - 1 - (int) uy;
+            } else if (r == 270) {
+              sourceX = width - 1 - (int) uy;
+              sourceY = (int) ux;
+            } else {
+              sourceX = (int) ux;
+              sourceY = (int) uy;
+            }
+            if (sourceX >= 0 && sourceX < width && sourceY >= 0 && sourceY < height) {
+              sum += frame[sourceY * width + sourceX] & 0xff;
+              count++;
+            }
           }
         }
-        grid[cellY * GRID + cellX] = count == 0 ? 0f : sum / count;
+        gray[y * SIZE + x] = count == 0 ? 0f : sum / count;
       }
     }
-    return grid;
+    return gray;
   }
 
-  /**
-   * Removes the mean brightness and scales the grid to unit variance so that lighting
-   * changes do not dominate the comparison.
-   *
-   * @param raw grid produced by {@link #downsample}
-   * @return normalised grid of the same length
-   */
-  public static float[] normalize(float[] raw) {
-    float[] normalised = new float[raw.length];
-    float mean = 0f;
-    for (float value : raw) mean += value;
-    mean /= raw.length;
-    float variance = 0f;
-    for (float value : raw) {
-      float delta = value - mean;
-      variance += delta * delta;
-    }
-    float deviation = (float) Math.sqrt(variance / raw.length);
-    if (deviation < 1f) deviation = 1f;
-    for (int i = 0; i < raw.length; i++) normalised[i] = (raw[i] - mean) / deviation;
-    return normalised;
-  }
-
-  /**
-   * Builds a descriptor from a normalised grid.
-   *
-   * @param normalised grid produced by {@link #normalize}
-   * @return descriptor of {@value #LENGTH} values
-   */
-  public static float[] describe(float[] normalised) {
-    return describe(normalised, 0, 0);
-  }
-
-  /**
-   * Builds a descriptor from a normalised grid, shifting the grid by the given number of
-   * cells to compensate for small alignment differences between two captures.
-   *
-   * @param normalised grid produced by {@link #normalize}
-   * @param shiftX horizontal shift in grid cells
-   * @param shiftY vertical shift in grid cells
-   * @return descriptor of {@value #LENGTH} values
-   */
-  public static float[] describe(float[] normalised, int shiftX, int shiftY) {
-    float[] shifted = new float[GRID * GRID];
-    for (int y = 0; y < GRID; y++) {
-      int sourceY = y + shiftY;
-      for (int x = 0; x < GRID; x++) {
-        int sourceX = x + shiftX;
-        float value = 0f;
-        if (sourceX >= 0 && sourceX < GRID && sourceY >= 0 && sourceY < GRID) {
-          value = normalised[sourceY * GRID + sourceX];
-        }
-        shifted[y * GRID + x] = value;
+  private static float[] ellipseMask() {
+    float[] mask = new float[SIZE * SIZE];
+    float center = (SIZE - 1) / 2f;
+    float radius = SIZE / 2f;
+    for (int y = 0; y < SIZE; y++) {
+      for (int x = 0; x < SIZE; x++) {
+        float nx = (x - center) / radius;
+        float ny = (y - center) / radius;
+        float r2 = nx * nx + ny * ny;
+        mask[y * SIZE + x] = Math.max(0f, Math.min(1f, (1f - r2) * ELLIPSE_FEATHER));
       }
     }
-    float[] intensity = unitLength(shifted);
-    float[] shape = unitLength(gradients(shifted));
-    float[] coarse = unitLength(coarse(shifted));
-    float[] descriptor = new float[LENGTH];
-    System.arraycopy(intensity, 0, descriptor, 0, INTENSITY_LENGTH);
-    System.arraycopy(shape, 0, descriptor, INTENSITY_LENGTH, SHAPE_LENGTH);
-    System.arraycopy(coarse, 0, descriptor, INTENSITY_LENGTH + SHAPE_LENGTH, COARSE_LENGTH);
-    return descriptor;
+    return mask;
   }
 
-  /**
-   * Cosine similarity of two descriptors.
-   *
-   * @return similarity in the range -1 to 1
-   */
-  public static double similarity(float[] first, float[] second) {
-    if (first == null || second == null || first.length != second.length) return 0.0;
-    double dot = 0.0;
-    double firstNorm = 0.0;
-    double secondNorm = 0.0;
-    for (int i = 0; i < first.length; i++) {
-      dot += (double) first[i] * second[i];
-      firstNorm += (double) first[i] * first[i];
-      secondNorm += (double) second[i] * second[i];
-    }
-    if (firstNorm <= 0.0 || secondNorm <= 0.0) return 0.0;
-    return dot / (Math.sqrt(firstNorm) * Math.sqrt(secondNorm));
-  }
-
-  /**
-   * Match score between a captured grid and the stored enrolment samples.
-   *
-   * <p>Every stored sample is compared at the best alignment, and the two strongest
-   * samples are averaged. Requiring more than one sample to agree keeps a single noisy
-   * frame from unlocking the app.
-   *
-   * @param samples stored enrolment descriptors
-   * @param normalised grid of the current capture
-   * @return match score, or 0 when there are no samples
-   */
-  public static double matchScore(float[][] samples, float[] normalised) {
-    if (samples == null || samples.length == 0 || normalised == null) return 0.0;
-    double[] bestPerSample = new double[samples.length];
-    for (int i = 0; i < samples.length; i++) bestPerSample[i] = -1.0;
-    for (int shiftY = -SHIFT_LIMIT; shiftY <= SHIFT_LIMIT; shiftY++) {
-      for (int shiftX = -SHIFT_LIMIT; shiftX <= SHIFT_LIMIT; shiftX++) {
-        float[] descriptor = describe(normalised, shiftX, shiftY);
-        for (int i = 0; i < samples.length; i++) {
-          double value = similarity(descriptor, samples[i]);
-          if (value > bestPerSample[i]) bestPerSample[i] = value;
-        }
-      }
-    }
-    double first = -1.0;
-    double second = -1.0;
-    for (double value : bestPerSample) {
-      if (value > first) {
-        second = first;
-        first = value;
-      } else if (value > second) {
-        second = value;
-      }
-    }
-    if (second < 0.0) return Math.max(0.0, first);
-    return (first + second) / 2.0;
-  }
-
-  /**
-   * Averages stored descriptors into a single descriptor, used to keep a descriptor that
-   * represents the whole enrolment.
-   *
-   * @param samples stored enrolment descriptors
-   * @return averaged descriptor, or null when there are no samples
-   */
-  public static float[] average(float[][] samples) {
-    if (samples == null || samples.length == 0) return null;
-    float[] mean = new float[LENGTH];
-    int used = 0;
-    for (float[] sample : samples) {
-      if (sample == null || sample.length != LENGTH) continue;
-      used++;
-      for (int i = 0; i < LENGTH; i++) mean[i] += sample[i];
-    }
-    if (used == 0) return null;
-    for (int i = 0; i < LENGTH; i++) mean[i] /= used;
-    return unitLength(mean);
-  }
-
-  /**
-   * Rough quality score of a capture, used to tell the user when the face is not yet
-   * usable. A score below one means the frame should be rejected.
-   *
-   * @param raw grid produced by {@link #downsample}
-   * @return quality score, positive when the frame looks usable
-   */
-  public static double quality(float[] raw) {
-    float mean = 0f;
-    for (float value : raw) mean += value;
-    mean /= raw.length;
-    float variance = 0f;
-    for (float value : raw) {
-      float delta = value - mean;
-      variance += delta * delta;
-    }
-    float deviation = (float) Math.sqrt(variance / raw.length);
-    double score = 0.0;
-    if (mean >= 40f && mean <= 215f) score += 1.0;
-    if (deviation >= 8f) score += 1.0;
-    if (deviation >= 18f) score += 0.5;
-    return score;
-  }
-
-  /** Signed orientation gradient histograms of every cell of the grid. */
-  private static float[] gradients(float[] grid) {
-    float[] shape = new float[SHAPE_LENGTH];
-    int cellSize = GRID / CELL_COUNT;
-    for (int cellY = 0; cellY < CELL_COUNT; cellY++) {
-      for (int cellX = 0; cellX < CELL_COUNT; cellX++) {
-        float[] bins = new float[BIN_COUNT];
-        for (int y = cellY * cellSize; y < (cellY + 1) * cellSize; y++) {
-          for (int x = cellX * cellSize; x < (cellX + 1) * cellSize; x++) {
-            float gx = sample(grid, x + 1, y) - sample(grid, x - 1, y);
-            float gy = sample(grid, x, y + 1) - sample(grid, x, y - 1);
-            float magnitude = (float) Math.sqrt(gx * gx + gy * gy);
-            if (magnitude < 1e-4f) continue;
-            double angle = Math.atan2(gy, gx);
-            if (angle < 0) angle += 2.0 * Math.PI;
-            double binSize = 2.0 * Math.PI / BIN_COUNT;
-            double position = angle / binSize;
-            int lower = (int) Math.floor(position) % BIN_COUNT;
-            int upper = (lower + 1) % BIN_COUNT;
-            double weight = position - Math.floor(position);
-            bins[lower] += (float) (magnitude * (1.0 - weight));
-            bins[upper] += (float) (magnitude * weight);
-          }
-        }
-        float norm = 0f;
-        for (float bin : bins) norm += bin * bin;
-        norm = (float) Math.sqrt(norm);
-        int offset = (cellY * CELL_COUNT + cellX) * BIN_COUNT;
-        if (norm > 1e-6f) {
-          for (int i = 0; i < BIN_COUNT; i++) shape[offset + i] = bins[i] / norm;
-        }
-      }
-    }
-    return shape;
-  }
-
-  /** Mean brightness of every cell of the grid. */
-  private static float[] coarse(float[] grid) {
-    float[] coarse = new float[COARSE_LENGTH];
-    int cellSize = GRID / CELL_COUNT;
-    for (int cellY = 0; cellY < CELL_COUNT; cellY++) {
-      for (int cellX = 0; cellX < CELL_COUNT; cellX++) {
+  private static float[] blur3x3(float[] input) {
+    float[] output = new float[input.length];
+    for (int y = 0; y < SIZE; y++) {
+      for (int x = 0; x < SIZE; x++) {
         float sum = 0f;
         int count = 0;
-        for (int y = cellY * cellSize; y < (cellY + 1) * cellSize; y++) {
-          for (int x = cellX * cellSize; x < (cellX + 1) * cellSize; x++) {
-            sum += grid[y * GRID + x];
-            count++;
+        for (int dy = -1; dy <= 1; dy++) {
+          int yy = y + dy;
+          if (yy < 0 || yy >= SIZE) continue;
+          for (int dx = -1; dx <= 1; dx++) {
+            int xx = x + dx;
+            if (xx < 0 || xx >= SIZE) continue;
+            int weight = (dx == 0 ? 2 : 1) * (dy == 0 ? 2 : 1);
+            sum += input[yy * SIZE + xx] * weight;
+            count += weight;
           }
         }
-        coarse[cellY * CELL_COUNT + cellX] = count == 0 ? 0f : sum / count;
+        output[y * SIZE + x] = sum / count;
       }
     }
-    float mean = 0f;
-    for (float value : coarse) mean += value;
-    mean /= coarse.length;
-    float variance = 0f;
-    for (float value : coarse) {
-      float delta = value - mean;
-      variance += delta * delta;
+    return output;
+  }
+
+  private static float[] histogramOfGradients(float[] gray, float[] mask) {
+    float[] hog = new float[HOG_LENGTH];
+    int cellSize = SIZE / GRID;
+    for (int y = 1; y < SIZE - 1; y++) {
+      for (int x = 1; x < SIZE - 1; x++) {
+        float weight = mask[y * SIZE + x];
+        if (weight <= 0f) continue;
+        float gx = gray[y * SIZE + x + 1] - gray[y * SIZE + x - 1];
+        float gy = gray[(y + 1) * SIZE + x] - gray[(y - 1) * SIZE + x];
+        float magnitude = (float) Math.sqrt(gx * gx + gy * gy) * weight;
+        if (magnitude < 1e-5f) continue;
+        float angle = (float) Math.atan2(gy, gx);
+        if (angle < 0f) angle += (float) Math.PI;
+        int bin = (int) (angle / (float) Math.PI * BINS);
+        if (bin >= BINS) bin = BINS - 1;
+        int cellX = Math.min(GRID - 1, x / cellSize);
+        int cellY = Math.min(GRID - 1, y / cellSize);
+        hog[(cellY * GRID + cellX) * BINS + bin] += magnitude;
+      }
     }
-    float deviation = (float) Math.sqrt(variance / coarse.length);
-    if (deviation < 1e-3f) deviation = 1e-3f;
-    for (int i = 0; i < coarse.length; i++) coarse[i] = (coarse[i] - mean) / deviation;
-    return coarse;
+    // Normalise each cell so one high-contrast area cannot dominate.
+    for (int cell = 0; cell < GRID * GRID; cell++) {
+      float norm = 0f;
+      int base = cell * BINS;
+      for (int bin = 0; bin < BINS; bin++) norm += hog[base + bin] * hog[base + bin];
+      norm = (float) Math.sqrt(norm);
+      if (norm > 1e-5f) {
+        for (int bin = 0; bin < BINS; bin++) hog[base + bin] /= norm;
+      }
+    }
+    l2Normalize(hog);
+    return hog;
   }
 
-  private static float sample(float[] grid, int x, int y) {
-    if (x < 0 || x >= GRID || y < 0 || y >= GRID) return 0f;
-    return grid[y * GRID + x];
+  private static float[] thumbnail(float[] gray, float[] mask) {
+    float[] thumb = new float[THUMB_LENGTH];
+    int cellSize = SIZE / THUMB;
+    for (int y = 0; y < THUMB; y++) {
+      for (int x = 0; x < THUMB; x++) {
+        float sum = 0f;
+        float weightSum = 0f;
+        for (int dy = 0; dy < cellSize; dy++) {
+          for (int dx = 0; dx < cellSize; dx++) {
+            int px = x * cellSize + dx;
+            int py = y * cellSize + dy;
+            float weight = mask[py * SIZE + px];
+            sum += gray[py * SIZE + px] * weight;
+            weightSum += weight;
+          }
+        }
+        thumb[y * THUMB + x] = weightSum > 1e-5f ? sum / weightSum : 0f;
+      }
+    }
+    l2Normalize(thumb);
+    return thumb;
   }
 
-  private static float[] unitLength(float[] values) {
+  private static void l2Normalize(float[] values) {
     float norm = 0f;
     for (float value : values) norm += value * value;
     norm = (float) Math.sqrt(norm);
-    float[] result = new float[values.length];
-    if (norm > 1e-6f) {
-      for (int i = 0; i < values.length; i++) result[i] = values[i] / norm;
+    if (norm > 1e-5f) {
+      for (int i = 0; i < values.length; i++) values[i] /= norm;
     }
-    return result;
+  }
+
+  /**
+   * Cosine similarity over the overlapping part of two grids, where the second
+   * grid is shifted by (dx, dy) in cells.
+   */
+  private static float cosineShift(float[] a, float[] b, int width, int height,
+      int stride, int dx, int dy) {
+    int x0 = Math.max(0, -dx);
+    int x1 = Math.min(width, width - dx);
+    int y0 = Math.max(0, -dy);
+    int y1 = Math.min(height, height - dy);
+    if (x0 >= x1 || y0 >= y1) return 0f;
+
+    double dot = 0.0;
+    double normA = 0.0;
+    double normB = 0.0;
+    for (int y = y0; y < y1; y++) {
+      for (int x = x0; x < x1; x++) {
+        int aBase = (y * width + x) * stride;
+        int bBase = ((y + dy) * width + (x + dx)) * stride;
+        for (int i = 0; i < stride; i++) {
+          float av = a[aBase + i];
+          float bv = b[bBase + i];
+          dot += av * bv;
+          normA += av * av;
+          normB += bv * bv;
+        }
+      }
+    }
+    if (normA < 1e-9 || normB < 1e-9) return 0f;
+    return (float) (dot / Math.sqrt(normA * normB));
+  }
+
+  private static void writeInt(byte[] target, int offset, int value) {
+    target[offset] = (byte) (value >>> 24);
+    target[offset + 1] = (byte) (value >>> 16);
+    target[offset + 2] = (byte) (value >>> 8);
+    target[offset + 3] = (byte) value;
+  }
+
+  private static int readInt(byte[] source, int offset) {
+    return ((source[offset] & 0xff) << 24)
+        | ((source[offset + 1] & 0xff) << 16)
+        | ((source[offset + 2] & 0xff) << 8)
+        | (source[offset + 3] & 0xff);
   }
 }
