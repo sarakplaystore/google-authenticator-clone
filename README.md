@@ -55,24 +55,84 @@ A dependency-free manual build script is also included. It requires `javac`, `aa
 ./build.sh
 ```
 
-The resulting APK is `Authenticator.apk` (version 1.2.0), which adds the per-code face-check reveal gate. The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. Because a local build generates a fresh debug key by default, Android may refuse to update an earlier debug build in place; uninstalling it first also removes its saved accounts and enrolled face. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
+The resulting APK is `Authenticator.apk` (version 1.2.0), which adds the per-code face-check reveal gate. The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
+
+### Signing identity
+
+The project signs every build with the same certificate, which is checked in at
+`tools/debug.keystore` (store and key password `android`, alias
+`authenticator-debug`). This is deliberate: a build signed with a different
+certificate cannot update an existing installation, and Android reports that
+as `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. `tools/debug_key.pem` and
+`tools/debug_cert.pem` hold the same key in PEM form for tools that cannot
+read PKCS#12.
+
+This is a **throwaway debug key, not a secret**. Its password is published in
+this repository, so anyone can sign an APK that claims to be this app. Never
+use it for a Play Store release; generate your own release key and keep it
+private.
+
+Because the key is stable, rebuilding the project and reinstalling the APK
+updates the app in place and keeps the saved accounts and the enrolled face.
+
+> **One-time step for existing installations.** The APK that was checked in
+> before this fix was signed with a key that was never committed, so that key
+> is gone. The repaired APK is therefore signed with a different certificate
+> and cannot update that older build in place. If you already installed it,
+> uninstall it once and install the new APK.
+> **Uninstalling deletes the app's local data — the saved accounts and the
+> enrolled face** — so save your account setup keys or recovery codes first
+> and re-add the accounts afterwards. Every later update works in place.
 
 ## Android 6.0+ installation compatibility
 
 The minimum supported version is **Android 6.0 (API 23)**; target SDK 35 does
 not mean Android 15 is required. The manual build explicitly enables v1 signing
 (required by Android 6), verifies signatures starting at API 23, and requires
-ZIP alignment. A packaging check rejects newer DEX formats, missing v1 signing
-entries, and compressed or unaligned resource tables. Gradle debug builds also
-explicitly enable v1 signing. Release signing configurations must enable it too.
+ZIP alignment. Gradle debug builds also explicitly enable v1 signing. Release
+signing configurations must enable it too.
+
+The APK is signed with all three signature schemes at once:
+
+- **v1 (JAR)** — the only scheme Android 6.0 understands.
+- **v2** — required by Android 7.0 and newer.
+- **v3** — used by Android 9.0 and newer.
+
+A packaging check (`tests/check_apk_compatibility.py`) rejects newer DEX
+formats, missing v1 signing entries, compressed or unaligned resource tables,
+entries that are not 4-byte aligned, a v1 signature that does not cover the
+actual entry contents, **a v2/v3 content digest that does not match the bytes
+of the file**, **a v2/v3 signature that is not a valid RSA signature by the
+certificate in the block**, and an APK that is not signed with the certificate
+in `tools/debug_cert.pem`.
+
+Both of the bolded checks are needed, because the two failure modes are
+opposite. The APK this project shipped before this fix was signed and then its
+ZIP container was rewritten — it was not 4-byte aligned and carried no
+`zipalign` padding, so it never came out of the documented build pipeline. That
+left the v2/v3 *content digest* stale, since the digest covers the ZIP layout
+and not just the entry contents; the v1 signature, which hashes entry contents
+only, still matched, which is why the file unzipped cleanly and passed every
+earlier check. Android 7.0 and newer verify v2/v3 first and rejected the
+package with `INSTALL_PARSE_FAILED_NO_CERTIFICATES` while the v1 signature
+still looked perfectly valid. The digest check catches that. The signature
+check catches the mirror image: a block that quotes the right digest but is not
+actually signed by the key it claims — a corruption the digest check cannot
+see, because the signature bytes live in the signing block, outside the data
+the digest covers.
 
 If installation still fails, capture the exact error (or use
 `adb install -r Authenticator.apk` from a computer):
 
+- `INSTALL_PARSE_FAILED_NO_CERTIFICATES`: the signature does not match the
+  file. Run `apksigner verify --min-sdk-version 23 Authenticator.apk` and
+  `python3 tests/check_apk_compatibility.py Authenticator.apk`; the packaging
+  check reports the offending part.
 - `INSTALL_FAILED_UPDATE_INCOMPATIBLE`: the installed app uses a different
-  signing key. Rebuild with the original keystore to update without losing data.
-  **Do not uninstall or clear app data unless you have recovery codes or setup
-  keys for every account**; doing so destroys the locally stored accounts.
+  signing key. Rebuild with `tools/debug.keystore` to update without losing
+  data. **Do not uninstall or clear app data unless you have recovery codes or
+  setup keys for every account**; doing so destroys the locally stored
+  accounts.
 - `INSTALL_FAILED_VERSION_DOWNGRADE`: install a build with a version code at
   least as high as the installed version.
 - `INSTALL_FAILED_OLDER_SDK`: confirm the phone runs Android 6.0 or newer and
@@ -92,8 +152,26 @@ python3 tests/check_apk_compatibility.py Authenticator.apk
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-These check packaging, not signature authenticity; `build.sh` also uses
-`apksigner verify --min-sdk-version 23` to verify the signatures cryptographically.
+These check packaging, the consistency of the signature with the file
+contents, and the signature itself: the v2/v3 signature bytes are verified as
+RSASSA-PKCS1-v1_5 signatures by the certificate in the signing block, so a
+corrupted or fabricated signature is rejected even when the content digest it
+quotes is correct. `build.sh` additionally uses
+`apksigner verify --min-sdk-version 23` to verify the signatures
+cryptographically.
+
+`tools/apk_sign.py` is a dependency-free signer (v1 + v2 + v3) used to
+reproduce and repair the checked-in APK when no Android SDK is available:
+
+```sh
+python3 tools/apk_sign.py --key tools/debug_key.pem --cert tools/debug_cert.pem \
+  --out Authenticator.apk Authenticator.apk
+```
+
+It re-aligns every entry to 4 bytes and regenerates all three signature
+schemes. Prefer `apksigner` for real releases; this tool exists so that the
+signature of the checked-in artifact can be produced and verified with
+nothing but Python.
 
 
 The dependency-free RFC 6238 regression vectors are in `tests/TotpVectors.java`, and the custom face descriptor checks are in `tests/FaceTemplateVectors.java`. After running `./build.sh`, run them with a JDK using the compiled app classes on the classpath:

@@ -14,11 +14,27 @@ android {
         versionName "1.2.0"
     }
 
-    // Android 6.0 cannot install APKs signed only with v2/v3.
+    // Android 6.0 cannot install APKs signed only with v2/v3, and every
+    // release needs a v2/v3 signature because the APK must be installable on
+    // modern Android as well. The signing identity lives in the repository
+    // (tools/debug.keystore) so that a rebuild keeps the same certificate:
+    // a different certificate makes Android refuse to update an existing
+    // installation with INSTALL_FAILED_UPDATE_INCOMPATIBLE.
     signingConfigs {
         debug {
+            storeFile file("../tools/debug.keystore")
+            storePassword "android"
+            keyAlias "authenticator-debug"
+            keyPassword "android"
             enableV1Signing true
             enableV2Signing true
+            enableV3Signing true
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
         }
     }
 

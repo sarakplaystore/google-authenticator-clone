@@ -109,13 +109,6 @@ else
   fi
 fi
 
-if [[ -n "${KEYTOOL:-}" ]]; then
-  KEYTOOL_BIN="$KEYTOOL"
-elif command -v keytool >/dev/null 2>&1; then
-  KEYTOOL_BIN="$(command -v keytool)"
-else
-  fail "keytool not found; install a JDK."
-fi
 command -v python3 >/dev/null 2>&1 || fail "python3 is required to check APK compatibility."
 command -v zip >/dev/null 2>&1 || fail "zip is required to package classes.dex."
 
@@ -169,14 +162,12 @@ APK_TO_SIGN="$BUILD_DIR/unsigned.apk"
 "$ZIPALIGN" -f 4 "$APK_TO_SIGN" "$BUILD_DIR/aligned.apk"
 APK_TO_SIGN="$BUILD_DIR/aligned.apk"
 
-KEYSTORE="${KEYSTORE:-$BUILD_DIR/debug.keystore}"
-if [[ ! -f "$KEYSTORE" ]]; then
-  mkdir -p "$(dirname "$KEYSTORE")"
-  "$KEYTOOL_BIN" -genkeypair -noprompt \
-    -keystore "$KEYSTORE" -storepass android -keypass android \
-    -alias authenticator-debug -dname "CN=Open Authenticator Debug" \
-    -keyalg RSA -keysize 2048 -validity 10000 >/dev/null 2>&1
-fi
+# The signing identity is checked in on purpose. Minting a fresh key on every
+# build would produce an APK that Android refuses to install over an existing
+# installation (INSTALL_FAILED_UPDATE_INCOMPATIBLE), because the certificate
+# would differ from the one the installed app was signed with.
+KEYSTORE="${KEYSTORE:-$ROOT/tools/debug.keystore}"
+[[ -f "$KEYSTORE" ]] || fail "the signing keystore $KEYSTORE is missing; it is part of the repository so that every build keeps the same signing identity."
 
 "${SIGN_CMD[@]}" sign \
   --ks "$KEYSTORE" --ks-key-alias authenticator-debug \
@@ -196,3 +187,4 @@ python3 "$ROOT/tests/check_apk_compatibility.py" "$OUTPUT_APK"
 printf '\nBuilt APK: %s\n' "$OUTPUT_APK"
 printf 'Package: app.openauth.authenticator | min SDK: 23 | target SDK: 35\n'
 printf 'Note: this APK is debug-signed for local testing/sideloading.\n'
+printf 'Signing identity: %s (stable, checked in at tools/debug.keystore).\n' "$KEYSTORE"
