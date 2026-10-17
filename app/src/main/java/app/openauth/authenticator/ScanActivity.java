@@ -60,7 +60,8 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
   @Override protected void onCreate(Bundle state) {
     super.onCreate(state);
     setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
-    getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        | WindowManager.LayoutParams.FLAG_SECURE);
     getWindow().setStatusBarColor(Color.BLACK);
     getWindow().setNavigationBarColor(Color.BLACK);
     getWindow().getDecorView().setSystemUiVisibility(0);
@@ -161,6 +162,16 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
   @Override protected void onPause() {
     releaseCamera();
     super.onPause();
+  }
+
+  @Override protected void onStop() {
+    super.onStop();
+    if (!isFinishing() && !isChangingConfigurations()) {
+      // Leaving the scanner for the home screen or turning the screen off must
+      // not leave the authenticator unlocked behind it.
+      FaceGate.unlocked = false;
+      FaceGate.promptOnNextResume = true;
+    }
   }
 
   @Override protected void onDestroy() {
