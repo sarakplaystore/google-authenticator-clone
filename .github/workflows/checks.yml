@@ -17,9 +17,17 @@ jobs:
           python-version: "3.12"
       - name: Check the checked-in APK
         # Verifies the DEX format, the ZIP alignment, the v1 signature
-        # coverage, the v2/v3 content digest and the signing certificate.
+        # coverage, the v2/v3 content digest, the RSA signature over each
+        # v2/v3 signed-data block and the signing certificate.
         # An APK whose signature does not match its own contents is rejected
         # by Android 7.0 and newer, so this has to run on every change.
         run: python3 tests/check_apk_compatibility.py Authenticator.apk
+      - name: The signer must still produce an APK that passes
+        # Guards tools/apk_sign.py itself: if it ever emits a signature the
+        # checker rejects, a rebuild would ship an un-installable APK again.
+        run: |
+          python3 tools/apk_sign.py --key tools/debug_key.pem \
+            --cert tools/debug_cert.pem --out resigned.apk Authenticator.apk
+          python3 tests/check_apk_compatibility.py resigned.apk
       - name: Run the regression tests
         run: python3 -m unittest discover -s tests -p "test_*.py" -v

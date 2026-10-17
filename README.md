@@ -76,9 +76,10 @@ Because the key is stable, rebuilding the project and reinstalling the APK
 updates the app in place and keeps the saved accounts and the enrolled face.
 
 > **One-time step for existing installations.** The APK that was checked in
-> before 1.2.0 was signed with a key that was never committed, so that key is
-> gone. The new APK therefore cannot update that older build in place. If you
-> already installed it, uninstall it once and install the new APK.
+> before this fix was signed with a key that was never committed, so that key
+> is gone. The repaired APK is therefore signed with a different certificate
+> and cannot update that older build in place. If you already installed it,
+> uninstall it once and install the new APK.
 > **Uninstalling deletes the app's local data — the saved accounts and the
 > enrolled face** — so save your account setup keys or recovery codes first
 > and re-add the accounts afterwards. Every later update works in place.
@@ -101,11 +102,24 @@ A packaging check (`tests/check_apk_compatibility.py`) rejects newer DEX
 formats, missing v1 signing entries, compressed or unaligned resource tables,
 entries that are not 4-byte aligned, a v1 signature that does not cover the
 actual entry contents, **a v2/v3 content digest that does not match the bytes
-of the file**, and an APK that is not signed with the certificate in
-`tools/debug_cert.pem`. That last group matters: an APK whose v2/v3 signature
-no longer matches its own contents is rejected by every Android release from
-7.0 onwards with `INSTALL_PARSE_FAILED_NO_CERTIFICATES`, even though its v1
-signature still looks valid and the file still unzips without errors.
+of the file**, **a v2/v3 signature that is not a valid RSA signature by the
+certificate in the block**, and an APK that is not signed with the certificate
+in `tools/debug_cert.pem`.
+
+Both of the bolded checks are needed, because the two failure modes are
+opposite. The APK this project shipped before this fix was signed and then its
+ZIP container was rewritten — it was not 4-byte aligned and carried no
+`zipalign` padding, so it never came out of the documented build pipeline. That
+left the v2/v3 *content digest* stale, since the digest covers the ZIP layout
+and not just the entry contents; the v1 signature, which hashes entry contents
+only, still matched, which is why the file unzipped cleanly and passed every
+earlier check. Android 7.0 and newer verify v2/v3 first and rejected the
+package with `INSTALL_PARSE_FAILED_NO_CERTIFICATES` while the v1 signature
+still looked perfectly valid. The digest check catches that. The signature
+check catches the mirror image: a block that quotes the right digest but is not
+actually signed by the key it claims — a corruption the digest check cannot
+see, because the signature bytes live in the signing block, outside the data
+the digest covers.
 
 If installation still fails, capture the exact error (or use
 `adb install -r Authenticator.apk` from a computer):
@@ -138,8 +152,11 @@ python3 tests/check_apk_compatibility.py Authenticator.apk
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-These check packaging and the consistency of the signature with the file
-contents. `build.sh` additionally uses
+These check packaging, the consistency of the signature with the file
+contents, and the signature itself: the v2/v3 signature bytes are verified as
+RSASSA-PKCS1-v1_5 signatures by the certificate in the signing block, so a
+corrupted or fabricated signature is rejected even when the content digest it
+quotes is correct. `build.sh` additionally uses
 `apksigner verify --min-sdk-version 23` to verify the signatures
 cryptographically.
 

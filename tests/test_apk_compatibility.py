@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import apk_sign  # noqa: E402
+import check_apk_compatibility  # noqa: E402
 from check_apk_compatibility import (  # noqa: E402
     check_apk,
     check_v1_signature,
@@ -108,6 +109,49 @@ class ApkCompatibilityTests(unittest.TestCase):
             with zipfile.ZipFile(tampered) as archive:
                 with self.assertRaisesRegex(ValueError, "does not match the contents"):
                     check_v2_v3_signature(bytes(raw), archive)
+
+    def test_v2_signature_must_be_cryptographically_valid(self):
+        """A signature that quotes the right digest but is not signed is rejected.
+
+        The signature bytes live in the signing block, which the content digest
+        does not cover, so only the signature check itself can catch this.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            signed = self.make_signed_apk(directory)
+            raw = bytearray(signed.read_bytes())
+            pairs, _, _ = check_apk_compatibility.find_signing_block(bytes(raw))
+            for block_id, v3 in ((check_apk_compatibility.V2_BLOCK_ID, False),
+                                 (check_apk_compatibility.V3_BLOCK_ID, True)):
+                signer = check_apk_compatibility.parse_signature_scheme_block(
+                    pairs[block_id], v3=v3)
+                algorithm, signature = signer["signatures"][0]
+                with self.subTest(block=hex(block_id)):
+                    tampered = bytearray(raw)
+                    offset = bytes(raw).find(signature)
+                    self.assertGreater(offset, 0)
+                    tampered[offset + 5] ^= 0xFF
+                    with zipfile.ZipFile(signed) as archive:
+                        with self.assertRaisesRegex(ValueError, "signature is not valid"):
+                            check_v2_v3_signature(bytes(tampered), archive)
+
+    def test_public_key_must_match_the_certificate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            signed = self.make_signed_apk(directory)
+            raw = bytearray(signed.read_bytes())
+            pairs, _, _ = check_apk_compatibility.find_signing_block(bytes(raw))
+            signer = check_apk_compatibility.parse_signature_scheme_block(
+                pairs[check_apk_compatibility.V2_BLOCK_ID])
+            # The same bytes are also inside the certificate, which the content
+            # digest covers; the signer's copy is the last occurrence in the file.
+            offset = bytes(raw).rfind(signer["public_key"])
+            self.assertGreater(offset, 0)
+            raw[offset + 4] ^= 0xFF
+            with zipfile.ZipFile(signed) as archive:
+                with self.assertRaisesRegex(ValueError, "public key"):
+                    check_v2_v3_signature(bytes(raw), archive)
+
+    def test_the_checked_in_apk_passes_every_check(self):
+        check_apk(ROOT / "Authenticator.apk", CERTIFICATE)
 
     def test_certificate_must_match_the_repository(self):
         with tempfile.TemporaryDirectory() as directory:

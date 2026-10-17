@@ -11,7 +11,16 @@ check that only looks for the presence of META-INF/CERT.RSA will happily
 pass an APK that no device will install.
 
 This module does not replace ``apksigner verify``; it reproduces the parts of
-the platform's verification that can be done with the standard library only.
+the platform's verification that can be done with the standard library only,
+including the RSA signature over each v2/v3 signed-data block.
+
+Checking the content digest alone is not enough: the signed APK that shipped
+with this project carried v2/v3 signature blocks whose RSA signature was
+perfectly valid but whose content digest no longer matched the file, which is
+why no Android 7.0+ device would install it while every packaging check passed.
+Verifying the signature bytes as well catches the opposite failure - a block
+that quotes the right digest but is not actually signed by the certificate it
+presents.
 """
 import base64
 import hashlib
@@ -25,12 +34,48 @@ V2_BLOCK_ID = 0x7109871A
 V3_BLOCK_ID = 0xF05368C0
 CHUNK_SIZE = 1024 * 1024
 
-DIGEST_ALGORITHMS = {
+# Content digest algorithm of each v2/v3 "chunked" signature algorithm id.
+# 0x0101/0x0102 are RSASSA-PSS, 0x0103/0x0104 RSASSA-PKCS1-v1_5, 0x020x ECDSA
+# and 0x0301 DSA; the first two digest the APK in 1 MB chunks with SHA-256 or
+# SHA-512.  There is no SHA-384 content digest in any APK signature scheme.
+CONTENT_DIGEST_ALGORITHMS = {
     0x0101: "sha256",
-    0x0102: "sha384",
+    0x0102: "sha512",
     0x0103: "sha256",
     0x0104: "sha512",
+    0x0201: "sha256",
+    0x0202: "sha512",
+    0x0301: "sha256",
 }
+
+# Signature algorithm ids whose content digest is the fs-verity style digest
+# (4 KB blocks, salted) rather than the 1 MB chunked digest above.  The chunked
+# digest is present alongside them whenever apksigner emits them, so these are
+# skipped here instead of being checked with the wrong construction.
+VERITY_DIGEST_ALGORITHMS = {0x0421, 0x0423, 0x0425}
+
+# id -> (hash used by the signature, mechanism)
+SIGNATURE_ALGORITHMS = {
+    0x0101: ("sha256", "pss"),
+    0x0102: ("sha512", "pss"),
+    0x0103: ("sha256", "pkcs1"),
+    0x0104: ("sha512", "pkcs1"),
+    0x0201: ("sha256", "ecdsa"),
+    0x0202: ("sha512", "ecdsa"),
+    0x0301: ("sha256", "dsa"),
+    0x0421: ("sha256", "pkcs1"),
+    0x0423: ("sha256", "ecdsa"),
+    0x0425: ("sha256", "dsa"),
+}
+
+# DigestInfo prefixes of the hash algorithms used above (RFC 8017, section 9.2).
+DIGEST_INFO_PREFIX = {
+    "sha1": bytes.fromhex("3021300906052b0e03021a05000414"),
+    "sha256": bytes.fromhex("3031300d060960864801650304020105000420"),
+    "sha512": bytes.fromhex("3051300d060960864801650304020305000440"),
+}
+
+RSA_ENCRYPTION_OID = bytes.fromhex("06092a864886f70d010101")
 
 
 # ---------------------------------------------------------------------------
@@ -93,18 +138,125 @@ def find_signing_block(raw):
 
 def signed_data_digests(block):
     """Return {algorithm id: digest} from a v2/v3 signature scheme block."""
+    return parse_signature_scheme_block(block)["digests"]
+
+
+def parse_signature_scheme_block(block, v3=False):
+    """Read one APK Signature Scheme v2/v3 block.
+
+    signer = signed_data, [minSdk, maxSdk], signatures, public_key
+    signed_data = digests, certificates, [minSdk, maxSdk], attributes
+
+    The SDK range is present in the v3 layout only, which is why the block id
+    decides how the signer is read.
+    """
     signers, _ = length_prefixed(block, 0)
     signer, _ = length_prefixed(signers, 0)
-    signed_data, _ = length_prefixed(signer, 0)
-    digests_section, _ = length_prefixed(signed_data, 0)
+    signed_data, offset = length_prefixed(signer, 0)
+    if v3:
+        offset += 8
+    signatures_section, offset = length_prefixed(signer, offset)
+    public_key, _ = length_prefixed(signer, offset)
+
+    digests_section, position = length_prefixed(signed_data, 0)
     digests = {}
-    offset = 0
-    while offset < len(digests_section):
-        entry, offset = length_prefixed(digests_section, offset)
+    cursor = 0
+    while cursor < len(digests_section):
+        entry, cursor = length_prefixed(digests_section, cursor)
         algorithm, = struct.unpack_from("<I", entry, 0)
         digest, _ = length_prefixed(entry, 4)
         digests[algorithm] = digest
-    return digests
+
+    certificates_section, position = length_prefixed(signed_data, position)
+    if v3:
+        position += 8
+    certificates = []
+    cursor = 0
+    while cursor < len(certificates_section):
+        certificate, cursor = length_prefixed(certificates_section, cursor)
+        certificates.append(certificate)
+
+    signatures = []
+    cursor = 0
+    while cursor < len(signatures_section):
+        entry, cursor = length_prefixed(signatures_section, cursor)
+        algorithm, = struct.unpack_from("<I", entry, 0)
+        signature, _ = length_prefixed(entry, 4)
+        signatures.append((algorithm, signature))
+
+    return {
+        "signed_data": signed_data,
+        "digests": digests,
+        "certificates": certificates,
+        "signatures": signatures,
+        "public_key": public_key,
+    }
+
+
+# ---------------------------------------------------------------------------
+# RSA verification (PKCS#1 v1.5), using nothing but the standard library
+# ---------------------------------------------------------------------------
+
+
+def find_subject_public_key_info(blob):
+    """Return (encoded SubjectPublicKeyInfo, BIT STRING element) of the first RSA key."""
+    def walk(data):
+        try:
+            children = list(der_children(data))
+        except (IndexError, struct.error, ValueError):
+            return None
+        for tag, value, encoded in children:
+            if tag != 0x30:
+                continue
+            try:
+                inner = list(der_children(value))
+            except (IndexError, struct.error, ValueError):
+                continue
+            if (len(inner) == 2 and inner[0][0] == 0x30 and inner[1][0] == 0x03
+                    and RSA_ENCRYPTION_OID in inner[0][2]):
+                return encoded, inner[1]
+            found = walk(value)
+            if found is not None:
+                return found
+        return None
+
+    return walk(blob)
+
+
+def rsa_public_key(bit_string):
+    """Return (modulus, exponent) of the RSA key inside a SubjectPublicKeyInfo BIT STRING."""
+    content = bit_string[1]
+    # BIT STRING content: one "unused bits" byte, then the RSAPublicKey sequence.
+    children = list(der_children(content[1:]))
+    if not children or children[0][0] != 0x30:
+        raise ValueError("unsupported RSA public key encoding")
+    numbers = list(der_children(children[0][1]))
+    if len(numbers) < 2 or numbers[0][0] != 0x02 or numbers[1][0] != 0x02:
+        raise ValueError("unsupported RSA public key encoding")
+    return (int.from_bytes(numbers[0][1], "big"),
+            int.from_bytes(numbers[1][1], "big"))
+
+
+def rsa_verify_pkcs1_v15(public_key, signature, message, hash_name):
+    """Verify an RSASSA-PKCS1-v1_5 signature; raise ValueError when it is wrong."""
+    modulus, exponent = public_key
+    size = (modulus.bit_length() + 7) // 8
+    if len(signature) != size:
+        raise ValueError("the signature is %d bytes, expected %d"
+                         % (len(signature), size))
+    value = pow(int.from_bytes(signature, "big"), exponent, modulus)
+    encoded = value.to_bytes(size, "big")
+    if encoded[0] != 0x00 or encoded[1] != 0x01:
+        raise ValueError("the signature is not a valid PKCS#1 v1.5 block")
+    separator = encoded.find(b"\x00", 2)
+    if separator < 10 or any(byte != 0xFF for byte in encoded[2:separator]):
+        raise ValueError("the signature padding is wrong")
+    prefix = DIGEST_INFO_PREFIX.get(hash_name)
+    if prefix is None:
+        raise ValueError("unsupported signature hash " + hash_name)
+    expected = prefix + hashlib.new(hash_name, message).digest()
+    if encoded[separator + 1:] != expected:
+        raise ValueError("the signed data does not match the signature")
 
 
 def chunk_digest(chunk, hasher):
@@ -308,27 +460,71 @@ def check_v1_signature(archive, names):
 
 
 def check_v2_v3_signature(raw, archive):
-    """The v2/v3 content digest must match the file that carries it."""
+    """The v2/v3 signature must match the file that carries it.
+
+    Two things are checked for every v2/v3 block: the content digest quoted in
+    the signed data must be the digest of this file, and the signature bytes
+    must be a valid signature by the certificate in the block over that signed
+    data.  A block that passes one and not the other is exactly the shape of
+    the broken artifact this project shipped once.
+    """
     pairs, block_start, _ = find_signing_block(raw)
     if not pairs:
         raise ValueError("Missing APK Signing Block; Android 7.0+ cannot verify the APK")
     eocd_offset = raw.rfind(b"PK\x05\x06")
     cd_size, cd_offset = struct.unpack_from("<II", raw, eocd_offset + 12)
     found = False
-    for block_id in (V2_BLOCK_ID, V3_BLOCK_ID):
+    for block_id, v3 in ((V2_BLOCK_ID, False), (V3_BLOCK_ID, True)):
         if block_id not in pairs:
             continue
         found = True
-        for algorithm, expected in signed_data_digests(pairs[block_id]).items():
-            name = DIGEST_ALGORITHMS.get(algorithm)
+        signer = parse_signature_scheme_block(pairs[block_id], v3=v3)
+        scheme = "v3" if v3 else "v2"
+
+        for algorithm, expected in signer["digests"].items():
+            if algorithm in VERITY_DIGEST_ALGORITHMS:
+                # fs-verity style digest; the chunked digest is checked too
+                # whenever apksigner emits one of these.
+                continue
+            name = CONTENT_DIGEST_ALGORITHMS.get(algorithm)
             if name is None:
                 raise ValueError("Unknown content digest algorithm 0x%04x" % algorithm)
             hasher = getattr(hashlib, name)
             got = content_digest(raw, block_start, cd_offset, eocd_offset, hasher)
             if got != expected:
                 raise ValueError(
-                    "The %s signature does not match the contents of this APK; "
-                    "Android 7.0 and newer will refuse to install it" % name)
+                    "The %s %s signature does not match the contents of this APK; "
+                    "Android 7.0 and newer will refuse to install it" % (scheme, name))
+
+        if not signer["certificates"]:
+            raise ValueError("The %s signature block carries no certificate" % scheme)
+        certificate = signer["certificates"][0]
+        key_info = find_subject_public_key_info(certificate)
+        if key_info is None:
+            raise ValueError("The %s signing certificate has no RSA public key" % scheme)
+        spki_encoded, bit_string = key_info
+        if spki_encoded != signer["public_key"]:
+            raise ValueError(
+                "The public key of the %s signature does not match its certificate" % scheme)
+
+        verified = False
+        for algorithm, signature in signer["signatures"]:
+            algorithm_info = SIGNATURE_ALGORITHMS.get(algorithm)
+            if algorithm_info is None:
+                raise ValueError("Unknown %s signature algorithm 0x%04x" % (scheme, algorithm))
+            hash_name, mechanism = algorithm_info
+            if mechanism != "pkcs1":
+                # PSS, ECDSA and DSA signatures are not reproduced here; the
+                # content digest and certificate checks above still apply.
+                continue
+            try:
+                rsa_verify_pkcs1_v15(rsa_public_key(bit_string), signature,
+                                     signer["signed_data"], hash_name)
+            except ValueError as error:
+                raise ValueError("The %s signature is not valid: %s" % (scheme, error))
+            verified = True
+        if not verified:
+            raise ValueError("The %s signature block contains no verifiable signature" % scheme)
     if not found:
         raise ValueError("Missing v2/v3 signature block")
 
@@ -356,4 +552,5 @@ if __name__ == "__main__":
         check_apk(path, certificate if certificate.exists() else None)
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         sys.exit("APK compatibility check failed: " + str(error))
-    print("APK checks passed (DEX 035, aligned, v1 coverage, v2/v3 content digest).")
+    print("APK checks passed (DEX 035, aligned, v1 coverage, v2/v3 content digest "
+          "and signature, signing certificate).")
