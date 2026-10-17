@@ -4,7 +4,11 @@ local.properties
 build/
 app/build/
 *.iml
+# The signing identity of this project is intentionally checked in so that
+# every build is signed with the same certificate and a rebuild can update an
+# existing installation. Other keystores are not tracked.
 *.keystore
+!tools/debug.keystore
 *.jks
 .DS_Store
 .venv/
