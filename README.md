@@ -23,6 +23,16 @@ The lock is a **convenience gate, not security-grade biometrics**. It is impleme
 
 A front-facing camera is required for initial setup. The app asks for camera permission when you register your face or scan a QR code; no storage or network permission is requested. Changing face registration or the backup PIN is only possible after the app has been unlocked.
 
+## Demo QR code (test setup)
+
+Use this sample to test the scan-and-add flow without connecting a real service. Open the app, complete its required face setup, then choose **Add account → Scan a QR code** and point the camera at this code on another screen or a printout.
+
+![Demo TOTP account setup QR code](demo-totp-qr.png)
+
+It creates a sample **Demo** account named `demo@example.com` with a 6-digit SHA-1 code that changes every 30 seconds. If you are testing on the same phone, choose **Add account → Enter a setup key**, then enter `demo@example.com` as the account name, `Demo` as the service, and `JBSWY3DPEHPK3PXP` as the key; the scanner reads from the live camera, not from image files.
+
+**This setup key is public and only for testing. Never use it for a real account:** anyone with the QR code or key can generate the same codes.
+
 ## Build
 
 Open this project in Android Studio, or use Gradle 8.10.2+ with Android SDK Platform 35 and Android Gradle Plugin 8.8.2 or newer:
