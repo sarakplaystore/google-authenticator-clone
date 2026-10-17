@@ -17,6 +17,14 @@
             android:exported="false"
             android:screenOrientation="portrait" />
         <activity
+            android:name="app.openauth.authenticator.FaceActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
+            android:name="app.openauth.authenticator.SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
             android:name="app.openauth.authenticator.MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
