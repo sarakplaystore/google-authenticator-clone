@@ -48,15 +48,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <p>This screen deliberately does not use Android's biometric APIs. It asks
  * for three front-camera samples during setup and compares live camera frames
- * with the stored descriptors afterwards. A six-digit backup PIN is created
- * during setup so a failed scan cannot lock the user out permanently.</p>
+ * with the stored descriptors afterwards. The same check also guards every
+ * code reveal ({@link #MODE_REVEAL}), so an unlocked app still masks its
+ * verification codes until the user passes a fresh scan. A six-digit backup
+ * PIN is created during setup so a failed scan cannot lock the user out
+ * permanently.</p>
  */
 @SuppressWarnings("deprecation")
 public final class FaceLockActivity extends Activity
     implements SurfaceHolder.Callback, Camera.PreviewCallback {
   public static final String EXTRA_MODE = "app.openauth.authenticator.FACE_MODE";
+  public static final String EXTRA_ACCOUNT_LABEL =
+      "app.openauth.authenticator.FACE_ACCOUNT_LABEL";
   public static final String MODE_ENROLL = "enroll";
   public static final String MODE_UNLOCK = "unlock";
+  /** A fresh face check before a hidden verification code is revealed. */
+  public static final String MODE_REVEAL = "reveal";
 
   private static final int REQUEST_CAMERA = 63;
   private static final int COLOR_BACKGROUND = Color.rgb(9, 12, 16);
@@ -71,6 +78,8 @@ public final class FaceLockActivity extends Activity
   private final List<FaceTemplate> captured = new ArrayList<FaceTemplate>();
 
   private boolean enrollMode;
+  private boolean revealMode;
+  private String accountLabel;
   private boolean finished;
   private boolean scanning;
   private boolean cameraStarted;
@@ -102,7 +111,10 @@ public final class FaceLockActivity extends Activity
 
   @Override protected void onCreate(Bundle state) {
     super.onCreate(state);
-    enrollMode = MODE_ENROLL.equals(getIntent().getStringExtra(EXTRA_MODE));
+    String mode = getIntent().getStringExtra(EXTRA_MODE);
+    enrollMode = MODE_ENROLL.equals(mode);
+    revealMode = MODE_REVEAL.equals(mode);
+    accountLabel = getIntent().getStringExtra(EXTRA_ACCOUNT_LABEL);
     faceStore = new FaceStore(this);
     if (!enrollMode) {
       try {
@@ -295,7 +307,9 @@ public final class FaceLockActivity extends Activity
     panelParams.setMargins(dp(12), dp(12), dp(12), dp(12));
     root.addView(panel, panelParams);
 
-    TextView deviceNote = text("On-device face recognition · no fingerprint or Touch ID",
+    TextView deviceNote = text(revealMode
+            ? "Face check required · recognition stays on this device"
+            : "On-device face recognition · no fingerprint or Touch ID",
         11, 0xFF8A94A3, Typeface.NORMAL);
     deviceNote.setGravity(Gravity.CENTER);
     FrameLayout.LayoutParams noteParams = new FrameLayout.LayoutParams(
@@ -356,13 +370,22 @@ public final class FaceLockActivity extends Activity
       }, null, null, null, null);
       setPrimaryEnabled(cameraStarted && !processing.get());
     } else {
-      titleView.setText("Unlock Authenticator");
+      titleView.setText(revealMode ? "Reveal verification code" : "Unlock Authenticator");
       captureProgress.setText("");
-      stepView.setText("FACE UNLOCK");
-      statusView.setText("Looking for your face");
-      instructionView.setText(enrolled.isEmpty()
-          ? "Face data is not available. Use your backup PIN."
-          : "Center your face inside the oval. Recognition stays on this device.");
+      stepView.setText(revealMode ? "FACE CHECK" : "FACE UNLOCK");
+      statusView.setText(revealMode ? "Scan to reveal" : "Looking for your face");
+      if (revealMode) {
+        instructionView.setText(enrolled.isEmpty()
+            ? "Face data is not available. Use your backup PIN."
+            : "Fresh face check required"
+                + (accountLabel != null && accountLabel.length() > 0
+                    ? " for " + accountLabel : "")
+                + ". The code stays hidden otherwise.");
+      } else {
+        instructionView.setText(enrolled.isEmpty()
+            ? "Face data is not available. Use your backup PIN."
+            : "Center your face inside the oval. Recognition stays on this device.");
+      }
       showActions("Use backup PIN", new View.OnClickListener() {
         @Override public void onClick(View view) { showPinUnlockDialog(); }
       }, "Cancel", new View.OnClickListener() {
@@ -370,7 +393,8 @@ public final class FaceLockActivity extends Activity
       }, null, null);
       if (enrolled.isEmpty()) {
         setPrimaryEnabled(true);
-        setStatus("Face data unavailable", "Use your backup PIN to unlock, or register again.");
+        setStatus("Face data unavailable", "Use your backup PIN to "
+            + (revealMode ? "reveal" : "unlock") + ", or register again.");
       }
       scanning = !enrolled.isEmpty() && cameraStarted;
       scanStartedAt = SystemClock.elapsedRealtime();
@@ -601,14 +625,18 @@ public final class FaceLockActivity extends Activity
         ViewGroup.LayoutParams.MATCH_PARENT, dp(50)));
     final AlertDialog dialog = new AlertDialog.Builder(this)
         .setTitle("Enter backup PIN")
-        .setMessage("Use the PIN you chose when registering your face.")
+        .setMessage(revealMode
+            ? "Use the PIN you chose when registering your face to reveal this code."
+            : "Use the PIN you chose when registering your face.")
         .setView(box)
         .setNegativeButton("Cancel", null)
-        .setPositiveButton("Unlock", null)
+        .setPositiveButton(revealMode ? "Reveal" : "Unlock", null)
         .create();
     dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
       @Override public void onDismiss(DialogInterface ignored) {
-        if (!finished && !FaceGate.unlocked) {
+        // In reveal mode the app is already unlocked; the scan screen must
+        // still resume if the PIN dialog is dismissed.
+        if (!finished && (revealMode || !FaceGate.unlocked)) {
           applyInitialUi();
           startCameraIfReady();
         }
@@ -663,7 +691,11 @@ public final class FaceLockActivity extends Activity
   private void finishSuccess() {
     if (finished) return;
     finished = true;
-    FaceGate.unlocked = true;
+    // A reveal check must never change the app-wide lock state; the caller
+    // decides which single code becomes visible.
+    if (!revealMode) {
+      FaceGate.unlocked = true;
+    }
     faceStore.clearPinFailures();
     releaseCamera();
     setResult(RESULT_OK);
@@ -682,9 +714,14 @@ public final class FaceLockActivity extends Activity
     if (finished) return;
     showPermissionPanel = true;
     scanStartedAt = 0L;
-    titleView.setText(enrollMode ? "Register your face" : "Unlock Authenticator");
+    titleView.setText(enrollMode ? "Register your face"
+        : revealMode ? "Reveal verification code" : "Unlock Authenticator");
     captureProgress.setText("");
-    if (enrollMode) stepView.setText("CAMERA REQUIRED"); else stepView.setText("FACE UNLOCK");
+    if (enrollMode) {
+      stepView.setText("CAMERA REQUIRED");
+    } else {
+      stepView.setText(revealMode ? "FACE CHECK" : "FACE UNLOCK");
+    }
     setStatus("Allow camera access",
         "Face registration and recognition happen entirely on this device. "
             + "Fingerprint and Touch ID are not used.");
@@ -715,7 +752,8 @@ public final class FaceLockActivity extends Activity
     cameraStarted = false;
     scanStartedAt = 0L;
     captureProgress.setText("");
-    stepView.setText(enrollMode ? "CAMERA REQUIRED" : "FACE UNLOCK");
+    stepView.setText(enrollMode ? "CAMERA REQUIRED"
+        : revealMode ? "FACE CHECK" : "FACE UNLOCK");
     setStatus("Camera unavailable", detail);
     if (enrollMode) {
       showActions("Try again", new View.OnClickListener() {
@@ -944,7 +982,8 @@ public final class FaceLockActivity extends Activity
         scanning = false;
         overlay.setMatched(true);
         statusView.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-        setStatus("Face recognized", "Unlocking your codes…");
+        setStatus("Face recognized",
+            revealMode ? "Showing your code…" : "Unlocking your codes…");
         setPrimaryEnabled(false);
         secondaryButton.setEnabled(false);
         ui.postDelayed(new Runnable() {
@@ -953,7 +992,9 @@ public final class FaceLockActivity extends Activity
           }
         }, 380L);
       } else {
-        setStatus("Hold still", "One more read and your codes will open.");
+        setStatus("Hold still", revealMode
+            ? "One more read and the code will be revealed."
+            : "One more read and your codes will open.");
       }
       return;
     }
