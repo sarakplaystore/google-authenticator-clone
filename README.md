@@ -10,8 +10,9 @@ An independent, offline-first Android authenticator for standard time-based one-
 - Copying a code also requires a face check, so a hidden code cannot be read from the clipboard.
 - Automatically refresh codes and show the remaining time.
 - Search, rename, remove, and copy account codes.
-- Require a custom, on-device face registration before the account list is shown. Setup takes three front-camera samples and creates a six-digit backup PIN.
-- Unlock with the front camera on every app open. The app does **not** use Android's biometric prompt, fingerprint sensors, Touch ID, or the device's built-in face unlock, and it does not request biometric permissions.
+- Require a custom, on-device face registration before the account list is shown. Setup auto-captures three guided angles (straight, your left, your right) plus a blink, and creates a six-digit backup PIN.
+- Unlock with a live face check on every app open: three prompts (blink, turn left/right, nod) in a random order that changes every attempt, performed by the enrolled face — a photo or a replayed video cannot follow them. The app does **not** use Android's biometric prompt, fingerprint sensors, Touch ID, or the device's built-in face unlock, and it does not request biometric permissions.
+- Fit any phone screen: the camera preview is full-screen edge-to-edge and centre-cropped (never stretched), the face guide is laid out in the measured free space, and notch/gesture-bar insets are honoured on every Android version.
 - Encrypt account data with AES-GCM using the Android Keystore; Android backup is disabled. Face descriptors and the PIN hash are separately encrypted with the Keystore.
 - Work entirely offline. Camera permission is used to register/unlock with your face and to scan QR codes. Screenshots and the recents preview are blocked with `FLAG_SECURE` while the app is open.
 
@@ -19,9 +20,15 @@ Google migration/transfer QR codes, HOTP accounts, cloud sync, and account expor
 
 ## Face unlock
 
-The first time the app opens it requires face registration. Three guided front-camera samples are reduced to numeric descriptors, encrypted with a key in the Android Keystore, and stored only on the device. Camera images are never written to storage. A six-digit backup PIN is created at the same time and can be used if a scan fails in poor light or with different eyewear.
+The first time the app opens it requires face registration. Three guided front-camera samples (straight, turned to your left, turned to your right — captured automatically when you hold each angle) and a blink are reduced to numeric descriptors, encrypted with a key in the Android Keystore, and stored only on the device. Camera images are never written to storage. A six-digit backup PIN is created at the same time and can be used if a scan fails in poor light or with different eyewear. Registrations made by older versions keep working.
 
-The lock is a **convenience gate, not security-grade biometrics**. It is implemented independently of the system biometric stack and is more easily spoofed than a dedicated biometric sensor (for example, with a photograph). The TOTP secrets themselves remain AES-GCM encrypted by the Android Keystore. If you forget both your face and your backup PIN, there is no recovery path; reinstall the app to start over, which also deletes the saved accounts.
+A scan is a **live check, not just an image match**:
+
+- Three challenges — blink, turn left, turn right, nod down — are drawn at random (with a `SecureRandom`) and asked in a random order, returning to centre between them. Every frame that counts towards a challenge must still match the enrolled face; turns must match the enrolled sample *for that side* and show the mouth moving further than the eyes (3D parallax a flat photo does not have, even when the photo itself is turned).
+- The screen flashes at random times and the face must measurably brighten in response (skipped in already-bright surroundings). An emissive replay on another phone does not respond; frames showing the regular moiré grid of a photographed display are rejected outright.
+- The platform face detector must see exactly one face, failed attempts pause face scanning for a cooldown (5 failures → 30 s, persisted like the PIN throttle), and the final confirmation requires both descriptor components to agree on three consecutive centred frames at a stricter threshold.
+
+This is still a **camera-only check, not certified biometrics**: it is built so that photographs, printed cut-outs, and replayed videos fail, but it cannot match a dedicated infrared/depth sensor against a determined attacker with a realistic mask or a compromised device, and no camera-only check can. The TOTP secrets themselves remain AES-GCM encrypted by the Android Keystore. If you forget both your face and your backup PIN, there is no recovery path; reinstall the app to start over, which also deletes the saved accounts.
 
 A front-facing camera is required for initial setup. The app asks for camera permission when you register your face or scan a QR code; no storage or network permission is requested. Changing face registration or the backup PIN is only possible after the app has been unlocked.
 
@@ -55,7 +62,7 @@ A dependency-free manual build script is also included. It requires `javac`, `aa
 ./build.sh
 ```
 
-The resulting APK is `Authenticator.apk` (version 1.2.0), which adds the per-code face-check reveal gate. The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
+The resulting APK is `Authenticator.apk` (version 1.3.0), which hardens the face check with randomised liveness challenges and a fully responsive, edge-to-edge scan screen. The checked-in APK in this workspace is debug-signed for testing and sideloading; create a separate release key and signing configuration before distribution. Minimum Android version is API 23 (Android 6.0). If you use an older standalone Java compiler or D8, you can set `JAVA_BOOTCLASSPATH` and `D8_ANDROID_JAR` to an older installed platform jar; current Android Studio builds should use the configured API 35 platform directly.
 
 ### Signing identity
 
@@ -174,22 +181,24 @@ signature of the checked-in artifact can be produced and verified with
 nothing but Python.
 
 
-The dependency-free RFC 6238 regression vectors are in `tests/TotpVectors.java`, and the custom face descriptor checks are in `tests/FaceTemplateVectors.java`. After running `./build.sh`, run them with a JDK using the compiled app classes on the classpath:
+The dependency-free RFC 6238 regression vectors are in `tests/TotpVectors.java`, the custom face descriptor checks are in `tests/FaceTemplateVectors.java`, and the anti-spoofing session checks (a synthetic face driven through the randomised prompts, plus static-photo, rigid-photo, screen-replay, impostor, and no-light-response attacks) are in `tests/LivenessVectors.java`. After running `./build.sh`, run them with a JDK using the compiled app classes on the classpath:
 
 ```sh
 mkdir -p build/test-classes
 javac -cp build/manual/classes -d build/test-classes \
-  tests/TotpVectors.java tests/FaceTemplateVectors.java
+  tests/TotpVectors.java tests/FaceTemplateVectors.java tests/LivenessVectors.java
 java -cp build/manual/classes:build/test-classes TotpVectors
 java -cp build/manual/classes:build/test-classes FaceTemplateVectors
+java -cp build/manual/classes:build/test-classes LivenessVectors
 ```
 
 ## Credits and technology used
 
 The face unlock and per-code reveal gate are implemented from first principles on top of the Android platform. No third-party face-recognition SDK, pre-trained ML model, cloud service, fingerprint sensor, Android `BiometricPrompt`, or Google Play Services is used.
 
-- **Android Camera API** (`android.hardware.Camera`) supplies the front-camera NV21 preview frames used for enrollment and for every unlock/reveal check.
-- **Custom face descriptor** (`FaceTemplate.java`)—a 48×48 illumination-normalised face crop, a 6×6 grid of 8-bin histograms of oriented gradients, and a 24×24 low-frequency thumbnail. Matching uses cosine similarity with a ±1-cell/±1-pixel shift search, and requires two consecutive live reads above the match threshold.
+- **Android Camera API** (`android.hardware.Camera`) supplies the front-camera NV21 preview frames used for enrollment and for every unlock/reveal check, and the platform **`android.media.FaceDetector`** vouches for face presence (exactly one face) on top of the app's own landmark geometry.
+- **Custom face descriptor** (`FaceTemplate.java`)—a 48×48 illumination-normalised face crop, a 6×6 grid of 8-bin histograms of oriented gradients, and a 24×24 low-frequency thumbnail. Matching uses cosine similarity with a ±1-cell/±1-pixel shift search; the final confirmation additionally requires both components to clear independent floors.
+- **Custom liveness engine** (`FaceSignals.java`, `LivenessSession.java`)—centre-surround eye localisation on a 96×96 crop, blink-openness and brow-jump detection, mouth/eye parallax, screen-moiré periodicity analysis, randomised screen-flash light response, and a pure-Java challenge–response state machine that fuses all of it with identity on every frame.
 - **Android Keystore with AES-256-GCM** (`FaceStore.java`)—the face descriptors and backup-PIN hash are encrypted at rest with a non-exportable key generated inside the Android Keystore.
 - **PBKDF2-HMAC-SHA1**—60,000-iteration backup-PIN hashing with a random salt, plus persisted attempt throttling.
 - **ZXing Core 3.5.3**—QR-code decoding. Licensed under Apache 2.0; see [`ZXING-LICENSE.txt`](ZXING-LICENSE.txt) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
