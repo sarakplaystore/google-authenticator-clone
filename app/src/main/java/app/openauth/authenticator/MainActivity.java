@@ -288,6 +288,7 @@ public final class MainActivity extends Activity {
 
   private View buildLockState() {
     final boolean enrolled = faceStore.isEnrolled();
+    final boolean hasPin = faceStore.hasPin();
     LinearLayout box = new LinearLayout(this);
     box.setOrientation(LinearLayout.VERTICAL);
     box.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -328,7 +329,7 @@ public final class MainActivity extends Activity {
     primaryParams.topMargin = dp(22);
     box.addView(primary, primaryParams);
 
-    if (enrolled) {
+    if (enrolled && hasPin) {
       TextView pin = pillButton("Use backup PIN", 0x00000000, COLOR_PRIMARY);
       pin.setOnClickListener(new View.OnClickListener() {
         @Override public void onClick(View view) { showPinUnlockDialog(); }
@@ -337,6 +338,19 @@ public final class MainActivity extends Activity {
           ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
       pinParams.topMargin = dp(8);
       box.addView(pin, pinParams);
+    } else if (enrolled) {
+      TextView removed = text(faceStore.wasPinRemovedByFailures()
+          ? "The backup PIN was removed after more than " + FaceStore.MAX_INVALID_SCANS
+              + " invalid face scans. Unlock with your face, then set a new PIN in "
+              + "Face unlock settings."
+          : "No backup PIN is set on this device. Unlock with your face, then set one "
+              + "in Face unlock settings.", 12, 0xFF9A6A00, Typeface.NORMAL);
+      removed.setGravity(Gravity.CENTER);
+      removed.setLineSpacing(dp(2), 1f);
+      LinearLayout.LayoutParams removedParams = new LinearLayout.LayoutParams(
+          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+      removedParams.topMargin = dp(14);
+      box.addView(removed, removedParams);
     }
 
     TextView privacy = text("Custom face recognition · no fingerprint or Touch ID",
@@ -386,8 +400,12 @@ public final class MainActivity extends Activity {
     if (!faceStore.hasPin()) {
       new AlertDialog.Builder(this)
           .setTitle("No backup PIN")
-          .setMessage("A backup PIN was not saved on this device. Register your face again "
-              + "to create one.")
+          .setMessage(faceStore.wasPinRemovedByFailures()
+              ? "The backup PIN was removed after more than "
+                  + FaceStore.MAX_INVALID_SCANS + " invalid face scans. Unlock with "
+                  + "your face, then set a new PIN under Face unlock settings."
+              : "A backup PIN was not saved on this device. Unlock with your face, then "
+                  + "set a PIN under Face unlock settings.")
           .setPositiveButton("OK", null)
           .show();
       return;
@@ -426,6 +444,9 @@ public final class MainActivity extends Activity {
                 }
                 if (accepted) {
                   faceStore.clearPinFailures();
+                  // A successful unlock breaks the consecutive-failure streak,
+                  // exactly like the face path in FaceLockActivity.
+                  faceStore.clearFaceFailures();
                   FaceGate.unlocked = true;
                   autoPromptShown = true;
                   dialog.dismiss();
@@ -463,7 +484,8 @@ public final class MainActivity extends Activity {
   }
 
   private void showFaceSettings() {
-    final String[] options = {"Update face registration", "Change backup PIN",
+    final String[] options = {"Update face registration",
+        faceStore.hasPin() ? "Change backup PIN" : "Set backup PIN",
         "How face unlock works"};
     new AlertDialog.Builder(this)
         .setTitle("Face unlock")
@@ -496,7 +518,7 @@ public final class MainActivity extends Activity {
     confirmParams.topMargin = dp(8);
     form.addView(confirm, confirmParams);
     final AlertDialog dialog = new AlertDialog.Builder(this)
-        .setTitle("Change backup PIN")
+        .setTitle(faceStore.hasPin() ? "Change backup PIN" : "Set backup PIN")
         .setView(form)
         .setNegativeButton("Cancel", null)
         .setPositiveButton("Save", null)
@@ -548,7 +570,10 @@ public final class MainActivity extends Activity {
             + "follow the random prompts, so it cannot unlock the app. Failed attempts "
             + "pause face scanning for a cooldown.\n\nThree numeric face descriptors are "
             + "stored encrypted on this device; camera images are never saved. If a scan "
-            + "fails, use your 6-digit backup PIN.\n\nThis is still a camera-only check, "
+            + "fails, use your 6-digit backup PIN. After more than "
+            + FaceStore.MAX_INVALID_SCANS + " consecutive invalid face scans the backup PIN "
+            + "is deleted; a successful unlock resets that count. You can set a new PIN "
+            + "under Face unlock settings after unlocking.\n\nThis is still a camera-only check, "
             + "not a certified biometric sensor. Your TOTP secrets remain encrypted with "
             + "the Android Keystore.")
         .setPositiveButton("Got it", null)

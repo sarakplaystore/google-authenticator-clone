@@ -312,6 +312,10 @@ V3_BLOCK_ID = 0xF05368C0
 VERITY_PADDING_ID = 0x42726577
 ALG_RSA_PKCS1_SHA256 = 0x0103
 STRIPPING_PROTECTION_ATTR = 0xBEEFF00D
+# A v3 signer may not claim to apply below Android 7.0 (API 24). apksigner
+# emits max(minSdkVersion, 24) and rejects an APK whose v3 signer starts at 23
+# with "No supported signatures", which is also how Android 9.0+ reads it.
+V3_MIN_SDK = 24
 
 
 def chunk_digest(chunk, hasher):
@@ -507,11 +511,14 @@ def sign_apk(input_path, output_path, key_path, cert_path,
                               0, 0, alg_id)
         pairs.append((V2_BLOCK_ID, length_prefixed(signer)))
     if v3:
+        # The signing block's SDK range is part of the signed data, so both
+        # copies must use the clamped value.
+        v3_min_sdk = max(min_sdk, V3_MIN_SDK)
         signed_data = build_signed_data(digest, alg_id, cert_der, True,
-                                        min_sdk, 0x7FFFFFFF)
+                                        v3_min_sdk, 0x7FFFFFFF)
         signature = rsa_sign_sha256(n, d, signed_data)
         signer = build_signer(signed_data, signature, cert_der, spki_der, True,
-                              min_sdk, 0x7FFFFFFF, alg_id)
+                              v3_min_sdk, 0x7FFFFFFF, alg_id)
         pairs.append((V3_BLOCK_ID, length_prefixed(signer)))
 
     block = build_signing_block(pairs)

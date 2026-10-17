@@ -33,10 +33,19 @@ public final class FaceStore {
   private static final String PIN_BLOCKED_UNTIL = "pin_blocked_until";
   private static final String FACE_FAILURES = "face_failures";
   private static final String FACE_BLOCKED_UNTIL = "face_blocked_until";
+  /** Consecutive invalid face scans; reset by a successful unlock. */
+  private static final String INVALID_FACE_SCANS = "invalid_face_scans";
+  private static final String PIN_REMOVED_BY_FAILURES = "pin_removed_by_failures";
   private static final int MAX_PIN_FAILURES = 5;
   private static final long PIN_COOLDOWN_MS = 30000L;
   private static final int MAX_FACE_FAILURES = 5;
   private static final long FACE_COOLDOWN_MS = 30000L;
+  /**
+   * Once more than this many face scans in a row fail, the backup PIN is
+   * deleted. The face templates stay, so the owner can still unlock with a
+   * successful live scan (and can then set a new PIN in the settings).
+   */
+  public static final int MAX_INVALID_SCANS = 20;
   private static final String FORMAT_VERSION = "1";
   private static final Charset UTF8 = Charset.forName("UTF-8");
   private static final int PIN_ITERATIONS = 60000;
@@ -51,10 +60,16 @@ public final class FaceStore {
         .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
   }
 
+  /**
+   * True once face templates exist. A missing backup PIN (for example after
+   * the invalid-scan limit removed it, or for an old registration) does not
+   * make the app "unenrolled": face unlock must keep working so the owner can
+   * get back in and set a new PIN.
+   */
   public synchronized boolean isEnrolled() {
     try {
       Payload payload = read();
-      return payload != null && !payload.templates.isEmpty() && payload.pinHash != null;
+      return payload != null && !payload.templates.isEmpty();
     } catch (RuntimeException e) {
       return false;
     }
@@ -88,6 +103,7 @@ public final class FaceStore {
     payload.templates.addAll(templates);
     setPin(payload, pin);
     write(payload);
+    resetPinRemovalState();
   }
 
   public synchronized void saveTemplates(List<FaceTemplate> templates) {
@@ -114,6 +130,7 @@ public final class FaceStore {
     }
     setPin(payload, pin);
     write(payload);
+    resetPinRemovalState();
   }
 
   public synchronized boolean verifyPin(String pin) {
@@ -180,21 +197,91 @@ public final class FaceStore {
     return Math.max(1, (int) Math.ceil(remaining / 1000.0));
   }
 
-  public synchronized void recordFaceFailure() {
-    if (isFaceBlocked()) return;
-    int failures = preferences.getInt(FACE_FAILURES, 0) + 1;
-    if (failures >= MAX_FACE_FAILURES) {
-      preferences.edit()
-          .putLong(FACE_BLOCKED_UNTIL, System.currentTimeMillis() + FACE_COOLDOWN_MS)
-          .remove(FACE_FAILURES)
-          .commit();
-    } else {
-      preferences.edit().putInt(FACE_FAILURES, failures).commit();
+  /**
+   * Records one failed face attempt and returns true when this attempt
+   * exceeded {@link #MAX_INVALID_SCANS} and deleted the backup PIN.
+   *
+   * <p>The invalid-scan counter is separate from the short cooldown counter:
+   * it survives cooldowns and app restarts, and only a successful unlock
+   * resets it. Deleting the PIN fails closed: the face templates are kept,
+   * but there is no PIN left to fall back to until the owner passes a face
+   * scan and sets a new one.</p>
+   */
+  public synchronized boolean recordFaceFailure() {
+    if (!isFaceBlocked()) {
+      int failures = preferences.getInt(FACE_FAILURES, 0) + 1;
+      if (failures >= MAX_FACE_FAILURES) {
+        preferences.edit()
+            .putLong(FACE_BLOCKED_UNTIL, System.currentTimeMillis() + FACE_COOLDOWN_MS)
+            .remove(FACE_FAILURES)
+            .commit();
+      } else {
+        preferences.edit().putInt(FACE_FAILURES, failures).commit();
+      }
     }
+    int invalid = preferences.getInt(INVALID_FACE_SCANS, 0) + 1;
+    preferences.edit().putInt(INVALID_FACE_SCANS, invalid).commit();
+    if (invalid > MAX_INVALID_SCANS) {
+      return removeBackupPinAfterFailures();
+    }
+    return false;
   }
 
+  /** Clears the state that belongs to the PIN that was just (re)created. */
+  private void resetPinRemovalState() {
+    preferences.edit()
+        .remove(PIN_REMOVED_BY_FAILURES)
+        .remove(INVALID_FACE_SCANS)
+        .commit();
+  }
+
+  /** Number of consecutive failed face scans recorded so far. */
+  public synchronized int invalidScanCount() {
+    return preferences.getInt(INVALID_FACE_SCANS, 0);
+  }
+
+  /** Failed scans left before the backup PIN is removed (0 when already gone). */
+  public synchronized int scansUntilPinRemoval() {
+    if (!hasPin()) return 0;
+    return Math.max(0, MAX_INVALID_SCANS + 1 - invalidScanCount());
+  }
+
+  /** True when the backup PIN was deleted because of repeated failed scans. */
+  public synchronized boolean wasPinRemovedByFailures() {
+    return preferences.getBoolean(PIN_REMOVED_BY_FAILURES, false);
+  }
+
+  /** A successful authentication resets both the cooldown and invalid count. */
   public synchronized void clearFaceFailures() {
-    preferences.edit().remove(FACE_FAILURES).remove(FACE_BLOCKED_UNTIL).commit();
+    preferences.edit()
+        .remove(FACE_FAILURES)
+        .remove(FACE_BLOCKED_UNTIL)
+        .remove(INVALID_FACE_SCANS)
+        .commit();
+  }
+
+  /**
+   * Deletes only the PIN hash/salt from the encrypted payload. Face templates
+   * remain enrolled. Any storage failure is swallowed (and retried on the
+   * next failed attempt) because this runs on the scan screen and must never
+   * crash it.
+   */
+  private boolean removeBackupPinAfterFailures() {
+    try {
+      Payload payload = read();
+      if (payload == null || payload.pinHash == null) return false;
+      payload.pinHash = null;
+      payload.pinSalt = null;
+      write(payload);
+      preferences.edit()
+          .putBoolean(PIN_REMOVED_BY_FAILURES, true)
+          .remove(PIN_FAILURES)
+          .remove(PIN_BLOCKED_UNTIL)
+          .commit();
+      return true;
+    } catch (RuntimeException e) {
+      return false;
+    }
   }
 
   /** Returns an explanation when a PIN is weak or malformed, or null when it is fine. */

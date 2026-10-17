@@ -36,6 +36,30 @@ public final class FaceTemplateVectors {
     checkSame("smile", base,
         FaceTemplate.fromFrame(face(0, 1.0f, 0, 0, 0, 9), WIDTH, HEIGHT, 0));
 
+    // The activity can lock a detector-framed crop instead of the old fixed
+    // centre crop. The synthetic face has an eye pair at (240, 226.6) with a
+    // 92 px interpupillary distance; 3.2x that is a 294 px crop centred just
+    // below the eyes. It must stay consistent under lighting and motion.
+    FaceTemplate guidedBase = FaceTemplate.fromFrame(baseFrame, WIDTH, HEIGHT, 0,
+        0.5f, 0.4f, 0.613333f);
+    require(guidedBase != null && guidedBase.isUsable(),
+        "guided crop descriptor was not usable");
+    checkSame("guided brightness", guidedBase,
+        FaceTemplate.fromFrame(face(18, 1.0f, 0, 0, 0, 0), WIDTH, HEIGHT, 0,
+            0.5f, 0.4f, 0.613333f));
+    FaceTemplate guidedShifted = FaceTemplate.fromFrame(face(0, 1.0f, 30, 20, 0, 0),
+        WIDTH, HEIGHT, 0, 0.5625f, 0.43125f, 0.613333f);
+    require(guidedShifted != null, "guided shifted face descriptor was null");
+    checkSame("guided shift", guidedBase, guidedShifted);
+    byte[] guidedRotatedSource = rotateForSensor(face(0, 1.0f, 0, 0, 0, 0),
+        WIDTH, HEIGHT, 90);
+    FaceTemplate guidedRotated = FaceTemplate.fromFrame(guidedRotatedSource, HEIGHT, WIDTH,
+        90, 0.5f, 0.4f, 0.613333f);
+    require(guidedRotated != null, "guided rotated descriptor was null");
+    require(guidedBase.similarity(guidedRotated) >= 0.97f,
+        "guided rotation changed the descriptor too much: "
+            + guidedBase.similarity(guidedRotated));
+
     for (int variant = 1; variant <= 6; variant++) {
       FaceTemplate other = FaceTemplate.fromFrame(
           face(0, 1.0f, 0, 0, 0, variant), WIDTH, HEIGHT, 0);

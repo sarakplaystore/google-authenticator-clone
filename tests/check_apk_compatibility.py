@@ -153,7 +153,9 @@ def parse_signature_scheme_block(block, v3=False):
     signers, _ = length_prefixed(block, 0)
     signer, _ = length_prefixed(signers, 0)
     signed_data, offset = length_prefixed(signer, 0)
+    min_sdk = max_sdk = signed_min_sdk = signed_max_sdk = None
     if v3:
+        min_sdk, max_sdk = struct.unpack_from("<II", signer, offset)
         offset += 8
     signatures_section, offset = length_prefixed(signer, offset)
     public_key, _ = length_prefixed(signer, offset)
@@ -169,6 +171,7 @@ def parse_signature_scheme_block(block, v3=False):
 
     certificates_section, position = length_prefixed(signed_data, position)
     if v3:
+        signed_min_sdk, signed_max_sdk = struct.unpack_from("<II", signed_data, position)
         position += 8
     certificates = []
     cursor = 0
@@ -190,6 +193,10 @@ def parse_signature_scheme_block(block, v3=False):
         "certificates": certificates,
         "signatures": signatures,
         "public_key": public_key,
+        "min_sdk": min_sdk,
+        "max_sdk": max_sdk,
+        "signed_min_sdk": signed_min_sdk,
+        "signed_max_sdk": signed_max_sdk,
     }
 
 
@@ -480,6 +487,22 @@ def check_v2_v3_signature(raw, archive):
         found = True
         signer = parse_signature_scheme_block(pairs[block_id], v3=v3)
         scheme = "v3" if v3 else "v2"
+
+        if v3:
+            # The SDK range is covered by the signature, so a mismatch between
+            # the signer and its signed data means one of them is corrupted.
+            if (signer["min_sdk"], signer["max_sdk"]) != (
+                    signer["signed_min_sdk"], signer["signed_max_sdk"]):
+                raise ValueError(
+                    "The v3 signature SDK range does not match its signed data")
+            # apksigner emits max(minSdkVersion, 24) and refuses a v3 signer
+            # that starts below Android 7.0 with "No supported signatures";
+            # Android 9.0+, which is the first release to read the v3 block,
+            # cannot use such a signer either.
+            if signer["min_sdk"] is None or signer["min_sdk"] < 24:
+                raise ValueError(
+                    "The v3 signature starts at API %s; a v3 signer must apply "
+                    "to API 24 or newer" % signer["min_sdk"])
 
         for algorithm, expected in signer["digests"].items():
             if algorithm in VERITY_DIGEST_ALGORITHMS:
