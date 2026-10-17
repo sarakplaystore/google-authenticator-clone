@@ -740,7 +740,9 @@ public final class FaceLockActivity extends Activity
   // ------------------------------------------------------- enrolment samples
 
   private void onEnrollFrame(FrameResult result) {
-    if (finished || !cameraStarted) return;
+    // Step 4 means the PIN step is already on screen; ignore further frames
+    // so a second blink cannot stack another dialog.
+    if (finished || !cameraStarted || enrollStep >= 4) return;
     if (result.template == null || !result.template.isUsable() || result.signals == null) {
       enrollHoldFrames = 0;
       setStatus("Move to better light",
