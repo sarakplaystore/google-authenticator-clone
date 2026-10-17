@@ -16,6 +16,7 @@ import android.view.Gravity;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -40,17 +41,26 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Camera-based QR importer for standard otpauth://totp codes. */
+/**
+ * Camera-based QR importer for standard otpauth://totp codes. The preview is
+ * centre-cropped (never stretched) and the viewfinder frame is laid out in
+ * the measured space between the top and bottom bars, so it fits any phone
+ * screen, including split-screen windows.
+ */
 @SuppressWarnings("deprecation")
 public final class ScanActivity extends Activity implements SurfaceHolder.Callback, Camera.PreviewCallback {
   public static final String EXTRA_RESULT = "app.openauth.authenticator.OTP_URI";
   private static final int REQUEST_CAMERA = 52;
 
+  private FrameLayout rootView;
   private SurfaceView previewView;
+  private View topBarView;
+  private View bottomView;
   private SurfaceHolder surfaceHolder;
   private Camera camera;
   private int previewWidth;
   private int previewHeight;
+  private float previewAspect = 9f / 16f;
   private boolean surfaceReady;
   private volatile boolean finished;
   private final AtomicBoolean decoding = new AtomicBoolean(false);
@@ -62,9 +72,21 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         | WindowManager.LayoutParams.FLAG_SECURE);
-    getWindow().setStatusBarColor(Color.BLACK);
-    getWindow().setNavigationBarColor(Color.BLACK);
-    getWindow().getDecorView().setSystemUiVisibility(0);
+    if (android.os.Build.VERSION.SDK_INT >= 30) {
+      getWindow().setDecorFitsSystemWindows(false);
+    }
+    getWindow().setStatusBarColor(Color.TRANSPARENT);
+    getWindow().setNavigationBarColor(Color.TRANSPARENT);
+    getWindow().getDecorView().setSystemUiVisibility(
+        View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+    if (android.os.Build.VERSION.SDK_INT >= 28) {
+      WindowManager.LayoutParams params = getWindow().getAttributes();
+      params.layoutInDisplayCutoutMode =
+          WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+      getWindow().setAttributes(params);
+    }
 
     Map<DecodeHintType, Object> hints = new EnumMap<DecodeHintType, Object>(DecodeHintType.class);
     hints.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
@@ -72,18 +94,21 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     reader.setHints(hints);
 
     FrameLayout root = new FrameLayout(this);
+    rootView = root;
     root.setBackgroundColor(Color.BLACK);
     previewView = new SurfaceView(this);
     surfaceHolder = previewView.getHolder();
     surfaceHolder.addCallback(this);
     root.addView(previewView, new FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT,
+        Gravity.CENTER));
 
     ViewfinderOverlay overlay = new ViewfinderOverlay(this);
     root.addView(overlay, new FrameLayout.LayoutParams(
         FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
     LinearLayout topBar = new LinearLayout(this);
+    topBarView = topBar;
     topBar.setGravity(Gravity.CENTER_VERTICAL);
     topBar.setPadding(dp(8), dp(8), dp(16), dp(8));
     topBar.setBackgroundColor(0x99000000);
@@ -111,6 +136,7 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     root.addView(topBar, topParams);
 
     LinearLayout bottom = new LinearLayout(this);
+    bottomView = bottom;
     bottom.setOrientation(LinearLayout.VERTICAL);
     bottom.setGravity(Gravity.CENTER);
     bottom.setPadding(dp(24), dp(18), dp(24), dp(26));
@@ -136,11 +162,16 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     root.addView(bottom, bottomParams);
     root.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
       @Override public WindowInsets onApplyWindowInsets(View view, WindowInsets insets) {
-        int topInset = android.os.Build.VERSION.SDK_INT >= 35 ? insets.getSystemWindowInsetTop() : 0;
-        int bottomInset = android.os.Build.VERSION.SDK_INT >= 35 ? insets.getSystemWindowInsetBottom() : 0;
-        topBar.setPadding(dp(8), dp(8) + topInset, dp(16), dp(8));
-        bottom.setPadding(dp(24), dp(18), dp(24), dp(26) + bottomInset);
+        int[] bars = systemBarInsets(insets);
+        topBar.setPadding(dp(8), dp(8) + bars[0], dp(16), dp(8));
+        bottom.setPadding(dp(24), dp(18), dp(24), dp(26) + bars[1]);
         return insets;
+      }
+    });
+    root.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+      @Override public void onLayoutChange(View view, int left, int top, int right,
+          int bottom, int oldLeft, int oldTop, int oldRight, int oldBottom) {
+        updatePreviewLayout(right - left, bottom - top);
       }
     });
     setContentView(root);
@@ -189,12 +220,64 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     if (camera != null) {
       try {
         camera.stopPreview();
+        refreshCameraOrientation();
         camera.setPreviewDisplay(holder);
         camera.setPreviewCallback(this);
         camera.startPreview();
       } catch (Exception e) {
         showCameraError();
       }
+    }
+  }
+
+  @Override public void onConfigurationChanged(android.content.res.Configuration configuration) {
+    super.onConfigurationChanged(configuration);
+    if (camera != null) {
+      try {
+        camera.stopPreview();
+        refreshCameraOrientation();
+        camera.setPreviewDisplay(surfaceHolder);
+        camera.setPreviewCallback(this);
+        camera.startPreview();
+      } catch (Exception e) {
+        showCameraError();
+      }
+    }
+  }
+
+  private int currentCameraId;
+
+  private void refreshCameraOrientation() {
+    setCameraOrientation(currentCameraId);
+  }
+
+  /** {top, bottom, left, right} system bar + cutout insets on any API level. */
+  private int[] systemBarInsets(WindowInsets insets) {
+    if (android.os.Build.VERSION.SDK_INT >= 30) {
+      android.graphics.Insets bars = insets.getInsets(
+          WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+      return new int[] {bars.top, bars.bottom, bars.left, bars.right};
+    }
+    return new int[] {insets.getSystemWindowInsetTop(), insets.getSystemWindowInsetBottom(),
+        insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetRight()};
+  }
+
+  /** Sizes the preview so the camera image fills the screen by centre-crop. */
+  private void updatePreviewLayout(int rootWidth, int rootHeight) {
+    if (previewView == null || rootWidth <= 0 || rootHeight <= 0) return;
+    int width;
+    int height;
+    float rootAspect = rootWidth / (float) rootHeight;
+    if (rootAspect > previewAspect) {
+      width = rootWidth;
+      height = Math.round(rootWidth / previewAspect);
+    } else {
+      height = rootHeight;
+      width = Math.round(rootHeight * previewAspect);
+    }
+    ViewGroup.LayoutParams current = previewView.getLayoutParams();
+    if (current.width != width || current.height != height) {
+      previewView.setLayoutParams(new FrameLayout.LayoutParams(width, height, Gravity.CENTER));
     }
   }
 
@@ -258,6 +341,7 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     }
     try {
       int id = findBackCamera();
+      currentCameraId = id;
       camera = id >= 0 ? Camera.open(id) : Camera.open();
       Camera.Parameters parameters = camera.getParameters();
       Camera.Size size = choosePreviewSize(parameters.getSupportedPreviewSizes());
@@ -296,13 +380,18 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
 
   private Camera.Size choosePreviewSize(List<Camera.Size> sizes) {
     if (sizes == null || sizes.isEmpty()) return null;
+    android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+    int displayLong = Math.max(metrics.widthPixels, metrics.heightPixels);
+    int displayShort = Math.max(1, Math.min(metrics.widthPixels, metrics.heightPixels));
+    double targetAspect = displayLong / (double) displayShort;
     Camera.Size best = sizes.get(0);
     double bestScore = Double.MAX_VALUE;
     for (Camera.Size size : sizes) {
-      double ratio = size.width / (double) size.height;
-      double ratioError = Math.abs(ratio - (16.0 / 9.0));
+      double aspect = Math.max(size.width, size.height)
+          / (double) Math.max(1, Math.min(size.width, size.height));
       double areaPenalty = size.width * (double) size.height > 1920.0 * 1080.0 ? 1.0 : 0.0;
-      double score = ratioError * 100.0 + areaPenalty + Math.abs(size.width - 1280) / 10000.0;
+      double score = Math.abs(aspect - targetAspect) * 6.0 + areaPenalty
+          + Math.abs(size.width - 1280) / 1600.0;
       if (score < bestScore) {
         best = size;
         bestScore = score;
@@ -327,6 +416,13 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
       result = (info.orientation - degrees + 360) % 360;
     }
     camera.setDisplayOrientation(result);
+    if (previewWidth > 0 && previewHeight > 0) {
+      boolean swapped = result == 90 || result == 270;
+      int displayWidth = swapped ? previewHeight : previewWidth;
+      int displayHeight = swapped ? previewWidth : previewHeight;
+      previewAspect = displayWidth / (float) Math.max(1, displayHeight);
+      if (rootView != null) updatePreviewLayout(rootView.getWidth(), rootView.getHeight());
+    }
   }
 
   private void acceptResult(Result result) {
@@ -394,9 +490,14 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
 
     @Override protected void onDraw(Canvas canvas) {
       super.onDraw(canvas);
-      float side = Math.min(getWidth() * 0.72f, dp(300));
+      float guideTop = topBarView != null && topBarView.getBottom() > 0
+          ? topBarView.getBottom() + dp(10) : getHeight() * 0.12f;
+      float guideBottom = bottomView != null && bottomView.getTop() > 0
+          ? bottomView.getTop() - dp(12) : getHeight() * 0.82f;
+      float available = Math.max(dp(140), guideBottom - guideTop);
+      float side = Math.min(Math.min(getWidth() * 0.78f, dp(320)), available * 0.96f);
       float left = (getWidth() - side) / 2f;
-      float top = (getHeight() - side) / 2f;
+      float top = guideTop + (available - side) / 2f;
       frame.set(left, top, left + side, top + side);
       int save = canvas.saveLayer(0, 0, getWidth(), getHeight(), null);
       canvas.drawRect(0, 0, getWidth(), getHeight(), dim);

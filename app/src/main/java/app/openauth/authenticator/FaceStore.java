@@ -31,8 +31,12 @@ public final class FaceStore {
   private static final String KEY_ALIAS = "openauthenticator.face.v1";
   private static final String PIN_FAILURES = "pin_failures";
   private static final String PIN_BLOCKED_UNTIL = "pin_blocked_until";
+  private static final String FACE_FAILURES = "face_failures";
+  private static final String FACE_BLOCKED_UNTIL = "face_blocked_until";
   private static final int MAX_PIN_FAILURES = 5;
   private static final long PIN_COOLDOWN_MS = 30000L;
+  private static final int MAX_FACE_FAILURES = 5;
+  private static final long FACE_COOLDOWN_MS = 30000L;
   private static final String FORMAT_VERSION = "1";
   private static final Charset UTF8 = Charset.forName("UTF-8");
   private static final int PIN_ITERATIONS = 60000;
@@ -152,6 +156,45 @@ public final class FaceStore {
 
   public synchronized void clearPinFailures() {
     preferences.edit().remove(PIN_FAILURES).remove(PIN_BLOCKED_UNTIL).commit();
+  }
+
+  /**
+   * Face attempts are throttled like the PIN: after five failed scans
+   * (timeouts, wrong faces, or suspected spoofs) the camera scan pauses for
+   * a cooldown and only the PIN works. Persisted so force-stopping the app
+   * does not reset it. Walking away mid-scan does not count as a failure.
+   */
+  public synchronized boolean isFaceBlocked() {
+    long until = preferences.getLong(FACE_BLOCKED_UNTIL, 0L);
+    if (until == 0L) return false;
+    if (System.currentTimeMillis() >= until) {
+      preferences.edit().remove(FACE_BLOCKED_UNTIL).remove(FACE_FAILURES).commit();
+      return false;
+    }
+    return true;
+  }
+
+  public synchronized int faceCooldownSeconds() {
+    if (!isFaceBlocked()) return 0;
+    long remaining = preferences.getLong(FACE_BLOCKED_UNTIL, 0L) - System.currentTimeMillis();
+    return Math.max(1, (int) Math.ceil(remaining / 1000.0));
+  }
+
+  public synchronized void recordFaceFailure() {
+    if (isFaceBlocked()) return;
+    int failures = preferences.getInt(FACE_FAILURES, 0) + 1;
+    if (failures >= MAX_FACE_FAILURES) {
+      preferences.edit()
+          .putLong(FACE_BLOCKED_UNTIL, System.currentTimeMillis() + FACE_COOLDOWN_MS)
+          .remove(FACE_FAILURES)
+          .commit();
+    } else {
+      preferences.edit().putInt(FACE_FAILURES, failures).commit();
+    }
+  }
+
+  public synchronized void clearFaceFailures() {
+    preferences.edit().remove(FACE_FAILURES).remove(FACE_BLOCKED_UNTIL).commit();
   }
 
   /** Returns an explanation when a PIN is weak or malformed, or null when it is fine. */

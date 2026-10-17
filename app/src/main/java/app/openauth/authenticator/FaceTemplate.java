@@ -18,8 +18,17 @@ public final class FaceTemplate {
   public static final int THUMB_LENGTH = THUMB * THUMB;
   public static final int BYTE_LENGTH = 4 + (HOG_LENGTH + THUMB_LENGTH) * 4;
 
-  /** A frame must reach this score on two consecutive reads before unlocking. */
-  public static final float MATCH_THRESHOLD = 0.78f;
+  /** A frame must reach this score before it can count as the enrolled face. */
+  public static final float MATCH_THRESHOLD = 0.83f;
+  /**
+   * Component floors for a strict (final-confirmation) match. A single blended
+   * score can be reached by an impostor who matches one component well; the
+   * strict check requires the gradient and thumbnail descriptors to agree
+   * independently, which impostor faces do not manage (see the calibration
+   * margins in tests/FaceTemplateVectors).
+   */
+  public static final float STRICT_HOG_FLOOR = 0.76f;
+  public static final float STRICT_THUMB_FLOOR = 0.80f;
   /** Minimum usable quality; darker or flatter frames are rejected. */
   public static final float MIN_QUALITY = 0.36f;
 
@@ -123,6 +132,20 @@ public final class FaceTemplate {
     return Math.max(0f, Math.min(1f, 0.55f * scores[0] + 0.45f * scores[1]));
   }
 
+  /**
+   * Strict identity confirmation used for the final unlock decision: the
+   * blended score must reach {@link #MATCH_THRESHOLD} and each descriptor
+   * component must independently clear its floor.
+   */
+  public boolean matchesStrict(FaceTemplate other) {
+    if (other == null) return false;
+    float[] scores = componentScores(other);
+    float blended = Math.max(0f, Math.min(1f, 0.55f * scores[0] + 0.45f * scores[1]));
+    return blended >= MATCH_THRESHOLD
+        && scores[0] >= STRICT_HOG_FLOOR
+        && scores[1] >= STRICT_THUMB_FLOOR;
+  }
+
   /** Package-private components for calibration tests: {gradient, thumbnail}. */
   float[] componentScores(FaceTemplate other) {
     if (other == null) return new float[] {0f, 0f};
@@ -173,17 +196,32 @@ public final class FaceTemplate {
   }
 
   private static float[] sampleFace(byte[] frame, int width, int height, int rotation) {
+    return sampleFaceSized(frame, width, height, rotation, SIZE);
+  }
+
+  /**
+   * Samples the centred face crop at an arbitrary resolution. Shared with
+   * {@link FaceSignals}, which needs a larger crop than the descriptor for
+   * reliable eye and mouth localisation. Returns a square grayscale image of
+   * {@code size}x{@code size}, or {@code null} for an unusable buffer.
+   */
+  static float[] sampleFaceSized(byte[] frame, int width, int height, int rotation,
+      int size) {
+    if (frame == null || width < 64 || height < 64 || frame.length < width * height
+        || size < 8) {
+      return null;
+    }
     int r = ((rotation % 360) + 360) % 360;
     int uprightWidth = (r == 90 || r == 270) ? height : width;
     int uprightHeight = (r == 90 || r == 270) ? width : height;
     float side = Math.min(uprightWidth, uprightHeight) * 0.72f;
     float left = uprightWidth / 2f - side / 2f;
     float top = uprightHeight * 0.36f - side / 2f;
-    float step = side / SIZE;
+    float step = side / size;
 
-    float[] gray = new float[SIZE * SIZE];
-    for (int y = 0; y < SIZE; y++) {
-      for (int x = 0; x < SIZE; x++) {
+    float[] gray = new float[size * size];
+    for (int y = 0; y < size; y++) {
+      for (int x = 0; x < size; x++) {
         float sum = 0f;
         int count = 0;
         for (int sy = 0; sy < 3; sy++) {
@@ -211,7 +249,7 @@ public final class FaceTemplate {
             }
           }
         }
-        gray[y * SIZE + x] = count == 0 ? 0f : sum / count;
+        gray[y * size + x] = count == 0 ? 0f : sum / count;
       }
     }
     return gray;

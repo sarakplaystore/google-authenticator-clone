@@ -15,10 +15,12 @@
         android:usesCleartextTraffic="false">
         <activity
             android:name="app.openauth.authenticator.ScanActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density"
             android:exported="false"
             android:screenOrientation="portrait" />
         <activity
             android:name="app.openauth.authenticator.FaceLockActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density"
             android:exported="false"
             android:screenOrientation="portrait"
             android:windowSoftInputMode="adjustResize" />

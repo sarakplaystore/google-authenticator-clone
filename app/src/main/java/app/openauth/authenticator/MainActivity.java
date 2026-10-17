@@ -304,10 +304,11 @@ public final class MainActivity extends Activity {
     box.addView(title);
 
     TextView description = text(enrolled
-            ? "Use your face to unlock the app. Every code reveal needs its own face check. "
-                + "Face data never leaves this device."
+            ? "Use the live face check to unlock the app \u2014 random blink and turn "
+                + "prompts mean a photo can't be used. Every code reveal needs its own "
+                + "face check. Face data never leaves this device."
             : "Face registration is required before your codes can be shown. "
-                + "Three camera samples are stored on this device.",
+                + "Three guided angles and a blink are stored only on this device.",
         15, COLOR_SECONDARY, Typeface.NORMAL);
     description.setGravity(Gravity.CENTER);
     description.setLineSpacing(dp(3), 1f);
@@ -539,11 +540,17 @@ public final class MainActivity extends Activity {
         .setTitle("How face unlock works")
         .setMessage("Authenticator uses its own camera-based face lock. It does not call "
             + "Android's biometric prompt and does not use your fingerprint, Touch ID, "
-            + "or the device's face unlock.\n\nThree numeric face descriptors are stored "
-            + "encrypted on this device; camera images are never saved. If a scan fails, "
-            + "use your 6-digit backup PIN.\n\nThis is a convenience lock, not "
-            + "security-grade biometrics: a photo of you could potentially fool it. Your "
-            + "TOTP secrets remain encrypted with the Android Keystore.")
+            + "or the device's face unlock.\n\nEvery scan is a live check, not just a "
+            + "match: three challenges (blink, turn left/right, nod) are asked in a random "
+            + "order and must be performed by your enrolled face, head turns are verified "
+            + "in 3D, the screen flashes at random times and your face must respond to the "
+            + "light, and replayed screens are rejected. A photo or a video of you cannot "
+            + "follow the random prompts, so it cannot unlock the app. Failed attempts "
+            + "pause face scanning for a cooldown.\n\nThree numeric face descriptors are "
+            + "stored encrypted on this device; camera images are never saved. If a scan "
+            + "fails, use your 6-digit backup PIN.\n\nThis is still a camera-only check, "
+            + "not a certified biometric sensor. Your TOTP secrets remain encrypted with "
+            + "the Android Keystore.")
         .setPositiveButton("Got it", null)
         .show();
   }
@@ -891,6 +898,13 @@ public final class MainActivity extends Activity {
       codeText = text("------", 31, COLOR_TEXT, Typeface.NORMAL);
       codeText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
       codeText.setLetterSpacing(0.045f);
+      codeText.setSingleLine(true);
+      // On narrow phones the digits shrink to fit instead of clipping
+      // against the eye and countdown controls.
+      if (android.os.Build.VERSION.SDK_INT >= 26) {
+        codeText.setAutoSizeTextTypeUniformWithConfiguration(
+            20, 31, 1, android.util.TypedValue.COMPLEX_UNIT_SP);
+      }
       codeRow.addView(codeText, new LinearLayout.LayoutParams(0,
           ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
       eye = new EyeIconView(MainActivity.this);
