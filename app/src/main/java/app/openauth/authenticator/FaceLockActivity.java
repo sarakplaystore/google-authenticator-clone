@@ -143,6 +143,16 @@ public final class FaceLockActivity extends Activity
     super.onPause();
   }
 
+  @Override protected void onStop() {
+    super.onStop();
+    if (!isFinishing() && !isChangingConfigurations() && FaceGate.unlocked) {
+      // An in-progress face update must not leave the main screen unlocked
+      // when the user leaves the app from here.
+      FaceGate.unlocked = false;
+      FaceGate.promptOnNextResume = true;
+    }
+  }
+
   @Override protected void onDestroy() {
     finished = true;
     ui.removeCallbacksAndMessages(null);
@@ -771,13 +781,11 @@ public final class FaceLockActivity extends Activity
       Camera.Size size = choosePreviewSize(parameters.getSupportedPreviewSizes());
       if (size != null) {
         parameters.setPreviewSize(size.width, size.height);
-        previewWidth = size.width;
-        previewHeight = size.height;
-      } else {
-        previewWidth = 640;
-        previewHeight = 480;
       }
       parameters.setPreviewFormat(android.graphics.ImageFormat.NV21);
+      Camera.Size actualSize = parameters.getPreviewSize();
+      previewWidth = actualSize != null ? actualSize.width : 640;
+      previewHeight = actualSize != null ? actualSize.height : 480;
       List<String> focusModes = parameters.getSupportedFocusModes();
       if (focusModes != null
           && focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
