@@ -142,6 +142,21 @@ public final class LivenessSession {
   private static final long RETRY_NOTICE_MS = 2400L;
   private static final long FLASH_EDGE_MS = 170L;
   private static final float FLASH_MIN_RESPONSE = 3.0f;
+  /**
+   * Lit frames are sampled from the first part of a pulse only. Camera
+   * auto-exposure shrinks the measured brightening the longer the flash
+   * stays on; steady-state mid-pulse frames can look unresponsive at night
+   * even though the face clearly lit up when the flash fired.
+   */
+  private static final long FLASH_ON_SAMPLE_WINDOW_MS = 520L;
+  /**
+   * A clear relative rise also counts as a light response. In a dark room
+   * the raw delta can end up small once auto-exposure has had its say,
+   * while a replayed screen never changes in response to the flash at all.
+   */
+  private static final float FLASH_MIN_RESPONSE_RATIO = 1.06f;
+  /** Smallest raw rise the relative rule will accept (keeps noise out). */
+  private static final float FLASH_MIN_RELATIVE_RISE = 1.5f;
   private static final float FLASH_BRIGHT_AMBIENT = 175f;
   /** Cap on re-armed pulses so a stalled attempt cannot flash forever. */
   private static final int MAX_FLASH_PULSES = 12;
@@ -710,8 +725,12 @@ public final class LivenessSession {
           || Math.abs(t - pulse[1]) < FLASH_EDGE_MS) {
         return; // exposure is still settling around an edge
       }
-      if (frame.flashOn && t >= pulse[0] && t < pulse[1]) {
+      if (t >= pulse[0] && t < pulse[1]) {
+        if (t - pulse[0] > FLASH_ON_SAMPLE_WINDOW_MS) {
+          return; // auto-exposure has compensated this flash away already
+        }
         litPulsesSampled.add(i);
+        break;
       }
     }
     List<Float> bucket = frame.flashOn ? flashOnLuma : flashOffLuma;
@@ -739,7 +758,13 @@ public final class LivenessSession {
         && litPulsesSampled.size() >= 2) {
       float off = median(flashOffLuma);
       float on = median(flashOnLuma);
-      if (off < FLASH_BRIGHT_AMBIENT && on - off < FLASH_MIN_RESPONSE) {
+      // Either kind of measurable brightening is evidence of a live face:
+      // a raw jump, or a clear relative rise above the noise floor. A
+      // replayed screen never changes in response to the flash at all.
+      boolean responded = on - off >= FLASH_MIN_RESPONSE
+          || (on - off >= FLASH_MIN_RELATIVE_RISE
+              && on >= off * FLASH_MIN_RESPONSE_RATIO);
+      if (off < FLASH_BRIGHT_AMBIENT && !responded) {
         fail(FailReason.NO_LIGHT_RESPONSE);
         return;
       }

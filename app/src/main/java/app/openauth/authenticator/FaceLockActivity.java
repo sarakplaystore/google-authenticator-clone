@@ -104,6 +104,15 @@ public final class FaceLockActivity extends Activity
   private static final int CROP_LOCK_FRAMES = 2;
   /** Give a working detector this long to frame the face before using the default crop. */
   private static final long CROP_SEARCH_TIMEOUT_MS = 2500L;
+  /**
+   * Fill-light hysteresis. A single threshold made the light strobe at
+   * night: lit faces measured just above the cutoff, the fill switched off,
+   * the scene dropped back below it, and the fill switched on again every
+   * few hundred milliseconds. The fill now lights below FILL_ON_LUMA and
+   * only stands down above FILL_OFF_LUMA.
+   */
+  private static final float FILL_ON_LUMA = 38f;
+  private static final float FILL_OFF_LUMA = 52f;
 
   private final Handler ui = new Handler();
   private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -128,6 +137,10 @@ public final class FaceLockActivity extends Activity
   private int cameraId = -1;
   private float previewAspect = 9f / 16f;
   private volatile boolean flashLit;
+  /** Sticky fill-light state; see {@link #FILL_ON_LUMA}/{@link #FILL_OFF_LUMA}. */
+  private boolean fillLit;
+  /** Luma readings are stale while the flash is on and briefly afterwards. */
+  private long flashCooldownUntilMs;
 
   private FaceStore faceStore;
   private List<FaceTemplate> enrolled = new ArrayList<FaceTemplate>();
@@ -2026,8 +2039,23 @@ public final class FaceLockActivity extends Activity
     if (finished) return;
     boolean flash = session != null
         && session.isFlashOn(SystemClock.elapsedRealtime());
-    boolean fill = !flash && cameraStarted && lastMeanLuma >= 0f && lastMeanLuma < 45f
-        && (session != null || enrollMode || scanRequested);
+    long nowMs = SystemClock.elapsedRealtime();
+    if (flash) {
+      // Hold the fill state through the pulse: the flash itself drives the
+      // measured luma up, and reacting to that would drop the fill the
+      // moment the pulse ends and strobe at night.
+      flashCooldownUntilMs = nowMs + 600L;
+    } else if (nowMs >= flashCooldownUntilMs) {
+      boolean scanning = session != null || enrollMode || scanRequested;
+      if (!cameraStarted || !scanning || lastMeanLuma < 0f) {
+        fillLit = false;
+      } else if (fillLit) {
+        if (lastMeanLuma > FILL_OFF_LUMA) fillLit = false;
+      } else if (lastMeanLuma < FILL_ON_LUMA) {
+        fillLit = true;
+      }
+    }
+    boolean fill = !flash && fillLit;
     flashLit = flash;
     float targetAlpha = flash ? 0.88f : fill ? 0.22f : 0f;
     if (Math.abs(flashView.getAlpha() - targetAlpha) > 0.01f) {
@@ -2044,6 +2072,7 @@ public final class FaceLockActivity extends Activity
 
   private void restoreScreenLight() {
     flashLit = false;
+    fillLit = false;
     if (flashView != null) flashView.setAlpha(0f);
     try {
       WindowManager.LayoutParams params = getWindow().getAttributes();

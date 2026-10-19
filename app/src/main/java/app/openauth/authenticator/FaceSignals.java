@@ -27,12 +27,31 @@ package app.openauth.authenticator;
  *       random times. An emissive replay screen does not respond.</li>
  * </ul>
  *
+ * <p>Landmark thresholds are stated in <em>canonical</em> contrast units: the
+ * crop is re-scaled to a reference dynamic range before the eyes and mouth
+ * are searched, so a face lit only by the screen at night measures like its
+ * well-lit twin instead of falling below fixed brightness cliffs. The
+ * luminance reported for the flash check is always the raw scene value.</p>
+ *
  * <p>The class is pure Java over {@code float[]} images so the geometry can be
  * unit tested on a plain JVM with synthetic faces.</p>
  */
 public final class FaceSignals {
   /** Side of the crop analysed for liveness (descriptor uses 48). */
   public static final int SIZE = 96;
+
+  /**
+   * Canonical crop contrast (std) the landmarks are measured at. A well-lit
+   * face sits near this level, so the historical thresholds keep their
+   * meaning while dim night frames are lifted to the same scale.
+   */
+  private static final float CANONICAL_STD = 48f;
+  /**
+   * Amplification cap for nearly flat crops: dividing by a tiny std would
+   * turn sensor noise into fake structure. Below roughly this raw contrast
+   * there is nothing reliable to amplify.
+   */
+  private static final float MIN_RAW_STD = 8f;
 
   // Landmark search windows in 96×96 crop coordinates. They are deliberately
   // generous: the face may sit nearer or further from the camera, which moves
@@ -67,7 +86,7 @@ public final class FaceSignals {
   public final boolean mouthFound;
   public final float mouthX;
   public final float mouthY;
-  /** Mean luma (0..255) over the elliptical face region. */
+  /** Mean luma (0..255) over the elliptical face region, in raw scene units. */
   public final float meanLuma;
   /** 0..1 strength of two-dimensional short-period grid interference. */
   public final float moireScore;
@@ -112,14 +131,39 @@ public final class FaceSignals {
   public static FaceSignals fromGray(float[] gray) {
     if (gray == null || gray.length != SIZE * SIZE) return null;
 
-    Blob leftEye = findEye(gray, EYE_L_X0, EYE_L_X1, EYE_Y0, EYE_Y1);
-    Blob rightEye = findEye(gray, EYE_R_X0, EYE_R_X1, EYE_Y0, EYE_Y1);
+    // Luminance for the flash-response check is always measured on the raw
+    // scene; only the landmark search below works on the normalised copy.
+    float meanLuma = faceMeanLuma(gray);
+
+    // Re-scale the crop to a canonical dynamic range. A face in a dark room
+    // has the same structure as a bright one with every difference scaled
+    // down; without this, fixed contrast thresholds lose the eyes at night
+    // and the face can never unlock. The divisor floor keeps a nearly flat,
+    // noise-only crop from being amplified into fake landmarks.
+    double sum = 0.0;
+    for (int i = 0; i < gray.length; i++) sum += gray[i];
+    float mean = (float) (sum / gray.length);
+    double variance = 0.0;
+    for (int i = 0; i < gray.length; i++) {
+      double delta = gray[i] - mean;
+      variance += delta * delta;
+    }
+    float std = (float) Math.sqrt(variance / gray.length);
+    float scale = CANONICAL_STD / Math.max(std, MIN_RAW_STD);
+    float[] norm = new float[SIZE * SIZE];
+    for (int i = 0; i < gray.length; i++) {
+      float value = (gray[i] - mean) * scale;
+      norm[i] = Math.max(-3f * CANONICAL_STD, Math.min(3f * CANONICAL_STD, value));
+    }
+
+    Blob leftEye = findEye(norm, EYE_L_X0, EYE_L_X1, EYE_Y0, EYE_Y1);
+    Blob rightEye = findEye(norm, EYE_R_X0, EYE_R_X1, EYE_Y0, EYE_Y1);
     boolean eyes = leftEye != null && rightEye != null
         && Math.abs(leftEye.y - rightEye.y) <= 8f;
     float gap = eyes ? rightEye.x - leftEye.x : -1f;
     if (eyes && (gap < 15f || gap > 47f)) eyes = false;
 
-    Blob mouth = findBlob(gray, MOUTH_X0, MOUTH_X1, MOUTH_Y0, MOUTH_Y1, 0.45f);
+    Blob mouth = findBlob(norm, MOUTH_X0, MOUTH_X1, MOUTH_Y0, MOUTH_Y1, 0.45f);
     boolean mouthOk = mouth != null && mouth.darkPixels >= 14;
 
     float inv = 1f / SIZE;
@@ -132,8 +176,8 @@ public final class FaceSignals {
         mouthOk,
         mouthOk ? mouth.x * inv : -1f,
         mouthOk ? mouth.y * inv : -1f,
-        faceMeanLuma(gray),
-        moireScore(gray));
+        meanLuma,
+        moireScore(norm));
   }
 
   /**
