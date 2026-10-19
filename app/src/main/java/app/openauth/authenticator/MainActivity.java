@@ -391,8 +391,9 @@ public final class MainActivity extends Activity {
             + "order and must be performed by your enrolled face, head turns are verified "
             + "in 3D, the screen flashes at random times and your face must respond to the "
             + "light, and replayed screens are rejected. A photo or a video of you cannot "
-            + "follow the random prompts, so it cannot unlock the app. Failed attempts "
-            + "pause face scanning for a cooldown.\n\nThree numeric face descriptors are "
+            + "follow the random prompts, so it cannot unlock the app. Scanning pauses "
+            + "for a 30-second cooldown only after " + FaceStore.MAX_FACE_FAILURES
+            + " consecutive failed scans.\n\nThree numeric face descriptors are "
             + "stored encrypted on this device; camera images are never saved. A live face "
             + "scan is the only way into the app, so keep a secure copy of each service's "
             + "recovery codes. If the enrolled face can no longer pass, reinstall the app "
