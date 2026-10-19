@@ -11,10 +11,12 @@ import java.util.Random;
  * is rendered frame by frame into NV21 buffers; a driver reads the
  * session's randomised prompts and "performs" them the way a live person
  * would (blink, turn with 3D-style parallax, nod, face brightening when
- * the screen flashes). Attack scenarios replay the same harness with a
- * static photo, a rigidly moved photo (no parallax, no blink), a
- * moiré-covered screen replay that ignores the flash, a live impostor,
- * and a live owner whose face never responds to the screen light.
+ * the screen flashes). Coaching scenarios check the live guidance
+ * (hold, eyes closed, wrong direction), a wrong-way recovery, and a
+ * missed prompt that is repeated once. Attack scenarios replay the same
+ * harness with a static photo, a rigidly moved photo (no parallax, no
+ * blink), a moiré-covered screen replay that ignores the flash, a live
+ * impostor, and a live owner whose face never responds to the screen light.
  *
  * <p>Run after {@code ./build.sh}:</p>
  * <pre>
@@ -31,6 +33,8 @@ public final class LivenessVectors {
     signalChecks();
 
     HashSet<String> orders = new HashSet<String>();
+    HashSet<LivenessSession.Guidance> guidanceSeen =
+        new HashSet<LivenessSession.Guidance>();
     for (int seed = 1; seed <= 5; seed++) {
       Result live = runScenario(new Scenario(seed));
       require(live.session.isPassed(),
@@ -42,10 +46,51 @@ public final class LivenessVectors {
       require(new HashSet<LivenessSession.Challenge>(live.sequence).size() == 3,
           "challenges must be distinct: " + live.sequence);
       orders.add(live.sequence.toString());
+      guidanceSeen.addAll(live.guidanceSeen);
       System.out.println("live seed " + seed + " passed in " + live.frames
           + " frames, challenges " + live.sequence);
     }
     require(orders.size() > 1, "challenge order must vary between attempts: " + orders);
+    require(guidanceSeen.contains(LivenessSession.Guidance.HOLD),
+        "a held turn/nod was never reported as HOLD: " + guidanceSeen);
+    require(guidanceSeen.contains(LivenessSession.Guidance.EYES_CLOSED),
+        "closed eyes during a blink were never reported: " + guidanceSeen);
+
+    // A user who starts turning the wrong way must get a wrong-direction
+    // hint, and must still be able to recover and pass.
+    Scenario mirrored = new Scenario(6);
+    mirrored.mirrorFirstTurn = true;
+    Result mirroredResult = runScenario(mirrored);
+    require(mirroredResult.guidanceSeen.contains(LivenessSession.Guidance.WRONG_DIRECTION),
+        "turning the opposite way never produced a hint: "
+            + mirroredResult.guidanceSeen);
+    require(mirroredResult.session.isPassed(),
+        "a short wrong-way detour should still recover: "
+            + mirroredResult.session.getPhase() + "/"
+            + mirroredResult.session.getFailReason());
+    System.out.println("wrong-way prompt recovered: " + mirroredResult.sequence);
+
+    // A user who misses the first prompt entirely should get it repeated
+    // with the retry coaching instead of losing the whole attempt.
+    Scenario delayed = new Scenario(7);
+    delayed.delayFirstChallengeMs = 9400L;
+    Result delayedResult = runScenario(delayed);
+    require(delayedResult.session.getRetriesUsed() >= 1,
+        "a missed prompt was not retried");
+    require(delayedResult.session.isPassed(),
+        "a retried prompt did not let the live owner pass: "
+            + delayedResult.session.getPhase() + "/"
+            + delayedResult.session.getFailReason()
+            + " retries=" + delayedResult.session.getRetriesUsed()
+            + " done=" + delayedResult.session.getChallengesDone()
+            + " frames=" + delayedResult.frames
+            + " seq=" + delayedResult.sequence
+            + " seen=" + delayedResult.guidanceSeen);
+    require(delayedResult.guidanceSeen.contains(
+            LivenessSession.Guidance.RETRY_CHALLENGE),
+        "the retry notice was never shown: " + delayedResult.guidanceSeen);
+    System.out.println("missed prompt retried once, then passed; retries="
+        + delayedResult.session.getRetriesUsed());
 
     Scenario photo = new Scenario(3);
     photo.staticPhoto = true;
@@ -53,13 +98,22 @@ public final class LivenessVectors {
     require(!photoResult.session.isPassed(), "a static photo passed the live check");
     require(photoResult.session.getChallengesDone() == 0,
         "a static photo completed a challenge: " + photoResult.sequence);
-    System.out.println("static photo rejected: " + photoResult.session.getFailReason());
+    require(photoResult.session.getPhase() == LivenessSession.Phase.FAILED
+            && photoResult.session.getFailReason() == LivenessSession.FailReason.TIMEOUT,
+        "a static photo should end as a timeout, got " + photoResult.session.getPhase()
+            + "/" + photoResult.session.getFailReason());
+    System.out.println("static photo rejected after retries: "
+        + photoResult.session.getFailReason());
 
     Scenario rigid = new Scenario(4);
     rigid.rigidPhoto = true;
     Result rigidResult = runScenario(rigid);
     require(!rigidResult.session.isPassed(),
         "a rigidly moved photo passed the live check (seq=" + rigidResult.sequence + ")");
+    require(rigidResult.session.getPhase() == LivenessSession.Phase.FAILED
+            && rigidResult.session.getFailReason() == LivenessSession.FailReason.TIMEOUT,
+        "a rigid photo should end as a timeout, got " + rigidResult.session.getPhase()
+            + "/" + rigidResult.session.getFailReason());
     System.out.println("rigid photo rejected: " + rigidResult.session.getFailReason());
 
     Scenario screen = new Scenario(2);
@@ -92,7 +146,8 @@ public final class LivenessVectors {
     System.out.println("no light response rejected: NO_LIGHT_RESPONSE");
 
     System.out.println("Passed liveness checks: live owner (5 random orders), "
-        + "static photo, rigid photo, screen replay, impostor, flash response.");
+        + "coaching (hold, wrong way, retry), static photo, rigid photo, "
+        + "screen replay, impostor, flash response.");
   }
 
   // ------------------------------------------------------------- signal units
@@ -172,6 +227,10 @@ public final class LivenessVectors {
     boolean rigidPhoto;
     boolean moire;
     boolean flashResponsive = true;
+    /** Deliberately turn the wrong way for the first turn prompt. */
+    boolean mirrorFirstTurn;
+    /** Ignore the first prompt for this long, to exercise the retry. */
+    long delayFirstChallengeMs;
 
     Scenario(long seed) {
       this.seed = seed;
@@ -183,6 +242,8 @@ public final class LivenessVectors {
     int frames;
     final List<LivenessSession.Challenge> sequence =
         new ArrayList<LivenessSession.Challenge>();
+    final HashSet<LivenessSession.Guidance> guidanceSeen =
+        new HashSet<LivenessSession.Guidance>();
   }
 
   private static Result runScenario(Scenario scenario) {
@@ -207,8 +268,10 @@ public final class LivenessVectors {
 
     LivenessSession.Challenge lastChallenge = null;
     int challengeFrames = 0;
+    int retriesSeen = 0;
+    long firstChallengeAtMs = -1L;
     long t = 0L;
-    for (int frame = 0; frame < 420; frame++) {
+    for (int frame = 0; frame < 600; frame++) {
       t += FRAME_MS;
       result.frames = frame + 1;
 
@@ -216,13 +279,31 @@ public final class LivenessVectors {
       if (challenge != lastChallenge) {
         lastChallenge = challenge;
         challengeFrames = 0;
-        if (challenge != null) result.sequence.add(challenge);
+        if (challenge != null) {
+          result.sequence.add(challenge);
+          if (firstChallengeAtMs < 0L) firstChallengeAtMs = t;
+        }
       } else {
         challengeFrames++;
       }
+      // A repeated prompt starts a fresh attempt: restart the local gesture
+      // timing so a delayed blink is performed again after the retry.
+      if (session.getRetriesUsed() != retriesSeen) {
+        retriesSeen = session.getRetriesUsed();
+        challengeFrames = 0;
+      }
 
-      if (!scenario.staticPhoto) {
-        drive(pose, session.getPhase(), challenge, challengeFrames);
+      boolean ignoreFirstPrompt = scenario.delayFirstChallengeMs > 0L
+          && result.sequence.size() == 1
+          && t - firstChallengeAtMs < scenario.delayFirstChallengeMs;
+      if (!scenario.staticPhoto && !ignoreFirstPrompt) {
+        if (scenario.mirrorFirstTurn && result.sequence.size() == 1
+            && challengeFrames < 5 && isTurn(challenge)) {
+          // Pull in the opposite direction of the first turn prompt.
+          drive(pose, session.getPhase(), opposite(challenge), challengeFrames);
+        } else {
+          drive(pose, session.getPhase(), challenge, challengeFrames);
+        }
       }
       pose.seed = 1000L + frame;
       pose.bright = scenario.flashResponsive && session.isFlashOn(t) ? 18 : 0;
@@ -244,8 +325,20 @@ public final class LivenessVectors {
       }
       session.onFrame(input);
       if (session.isFinished()) break;
+      result.guidanceSeen.add(session.getGuidance());
     }
     return result;
+  }
+
+  private static boolean isTurn(LivenessSession.Challenge challenge) {
+    return challenge == LivenessSession.Challenge.TURN_LEFT
+        || challenge == LivenessSession.Challenge.TURN_RIGHT;
+  }
+
+  private static LivenessSession.Challenge opposite(LivenessSession.Challenge challenge) {
+    return challenge == LivenessSession.Challenge.TURN_LEFT
+        ? LivenessSession.Challenge.TURN_RIGHT
+        : LivenessSession.Challenge.TURN_LEFT;
   }
 
   /** Moves the synthetic pose towards whatever the session asks for. */

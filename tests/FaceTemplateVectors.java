@@ -1,3 +1,4 @@
+import app.openauth.authenticator.FaceSignals;
 import app.openauth.authenticator.FaceTemplate;
 
 /**
@@ -60,13 +61,50 @@ public final class FaceTemplateVectors {
         "guided rotation changed the descriptor too much: "
             + guidedBase.similarity(guidedRotated));
 
+    // The activity re-anchors the crop on the measured eye pair before
+    // matching. The same face must stay above the threshold after a shift or
+    // a small pose change, and the aligned shift must not be worse than the
+    // old fixed crop.
+    FaceTemplate eyeBase = eyeAligned(baseFrame);
+    FaceTemplate eyeShifted = eyeAligned(face(0, 1.0f, 30, 20, 0, 0));
+    checkSame("eye-aligned shift", eyeBase, eyeShifted);
+    checkSame("eye-aligned brightness", eyeBase,
+        eyeAligned(face(20, 1.0f, 0, 0, 0, 0)));
+    FaceTemplate fixedShifted =
+        FaceTemplate.fromFrame(face(0, 1.0f, 30, 20, 0, 0), WIDTH, HEIGHT, 0);
+    float fixedShiftScore = base.similarity(fixedShifted);
+    float alignedShiftScore = eyeBase.similarity(eyeShifted);
+    require(alignedShiftScore >= fixedShiftScore - 0.01f,
+        "eye alignment made a shifted face worse: fixed=" + fixedShiftScore
+            + " aligned=" + alignedShiftScore);
+    FaceTemplate eyeLeft = eyeAligned(face(0, 1.0f, 0, 0, -1, 0));
+    FaceTemplate eyeRight = eyeAligned(face(0, 1.0f, 0, 0, 1, 0));
+    checkSame("eye-aligned pose left", eyeBase, eyeLeft);
+    checkSame("eye-aligned pose right", eyeBase, eyeRight);
+    require(eyeBase.similarity(eyeLeft) > 0.97f,
+        "eye-aligned left pose too far from straight: "
+            + eyeBase.similarity(eyeLeft));
+    float poseMargin = eyeLeft.similarity(eyeLeft) - eyeLeft.similarity(eyeRight);
+    require(poseMargin >= 0.025f,
+        "eye-aligned pose margin too small for the turn check: " + poseMargin);
+    System.out.println("eye alignment: shift " + fixedShiftScore + " -> "
+        + alignedShiftScore + ", pose L/R " + eyeLeft.similarity(eyeRight));
+
     for (int variant = 1; variant <= 6; variant++) {
-      FaceTemplate other = FaceTemplate.fromFrame(
-          face(0, 1.0f, 0, 0, 0, variant), WIDTH, HEIGHT, 0);
+      byte[] otherFrame = face(0, 1.0f, 0, 0, 0, variant);
+      FaceTemplate other = FaceTemplate.fromFrame(otherFrame, WIDTH, HEIGHT, 0);
       require(other != null, "different face " + variant + " was null");
       float score = base.similarity(other);
       require(score < FaceTemplate.MATCH_THRESHOLD,
           "different face " + variant + " scored too high: " + score);
+      FaceSignals otherSignals = FaceSignals.fromFrame(otherFrame, WIDTH, HEIGHT, 0);
+      if (otherSignals != null && otherSignals.eyesFound) {
+        FaceTemplate eyeOther = eyeAligned(otherFrame);
+        float alignedScore = eyeBase.similarity(eyeOther);
+        require(alignedScore < FaceTemplate.MATCH_THRESHOLD,
+            "eye-aligned different face " + variant + " scored too high: "
+                + alignedScore);
+      }
     }
 
     byte[] encoded = base.toBytes();
@@ -91,6 +129,23 @@ public final class FaceTemplateVectors {
 
     System.out.println("Passed custom face descriptor checks: lighting, pose, shift, "
         + "serialisation, rotation, quality, and impostor separation.");
+  }
+
+  /**
+   * Matches the activity's identity pipeline: locate the eyes in the default
+   * crop, re-anchor a crop on them, and describe that crop.
+   */
+  private static FaceTemplate eyeAligned(byte[] frame) {
+    FaceSignals signals = FaceSignals.fromFrame(frame, WIDTH, HEIGHT, 0);
+    require(signals != null && signals.eyesFound, "eye landmarks not found for alignment");
+    FaceTemplate.FaceCrop crop = FaceTemplate.cropFromEyes(
+        signals.eyeMidX, signals.eyeMidY, signals.eyeGap,
+        0.5f, 0.36f, 0.72f, WIDTH, HEIGHT);
+    FaceTemplate template = FaceTemplate.fromFrame(frame, WIDTH, HEIGHT, 0,
+        crop.centerX, crop.centerY, crop.side);
+    require(template != null, "eye-aligned descriptor was null");
+    require(template.isUsable(), "eye-aligned descriptor was not usable");
+    return template;
   }
 
   private static void checkSame(String label, FaceTemplate base, FaceTemplate candidate) {

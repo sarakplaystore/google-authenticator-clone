@@ -104,10 +104,6 @@ public final class FaceLockActivity extends Activity
   private static final int CROP_LOCK_FRAMES = 2;
   /** Give a working detector this long to frame the face before using the default crop. */
   private static final long CROP_SEARCH_TIMEOUT_MS = 2500L;
-  /** Crop side around the eyes, as a multiple of the detected eye distance. */
-  private static final float FACE_CROP_EYE_RATIO = 3.2f;
-  /** Move the crop centre this far below the eye midpoint (fraction of its side). */
-  private static final float FACE_CROP_EYE_OFFSET = 0.10f;
 
   private final Handler ui = new Handler();
   private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -140,6 +136,7 @@ public final class FaceLockActivity extends Activity
   private LivenessSession session;
   private int lastChallengeShown = -1;
   private int lastBlockedSecond = -1;
+  private LivenessSession.Guidance lastGuidance = LivenessSession.Guidance.NONE;
 
   // Native platform face detection (presence + framing; liveness is ours).
   private FaceDetector faceDetector;
@@ -209,6 +206,9 @@ public final class FaceLockActivity extends Activity
       updateScreenLight();
       tickBlockedCountdown();
       tickEnrollBlinkTimeout();
+      // Keeps the cue pulse and the blink demonstration moving, but only
+      // while a scan can show one (panels have nothing to animate).
+      if (overlay != null && (session != null || enrollMode)) overlay.invalidate();
       ui.postDelayed(this, 120L);
     }
   };
@@ -423,6 +423,8 @@ public final class FaceLockActivity extends Activity
     statusView = text("", compactLayout ? 20 : 23, COLOR_TEXT, Typeface.BOLD);
     statusView.setMaxLines(2);
     statusView.setEllipsize(TextUtils.TruncateAt.END);
+    // Prompt changes are announced by TalkBack as well as shown.
+    statusView.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
     LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
     statusParams.topMargin = dp(4);
@@ -619,10 +621,12 @@ public final class FaceLockActivity extends Activity
                 + (accountLabel != null && accountLabel.length() > 0
                     ? " for " + accountLabel : "")
                 + ". Follow the prompts — they change every time."
-            : "Center your face inside the oval, then follow the prompts. "
-                + "They change every time so a photo can't be used.");
+            : "Center your face inside the oval, then follow three quick prompts: "
+                + "a blink, a head turn or a nod. They change every time; the screen "
+                + "flashes briefly to confirm a live face.");
     showCancelAction();
     overlay.setState(OverlayMode.ACTIVE, 0f, OverlayCue.NONE);
+    overlay.setHoldProgress(0f);
     ensureSession();
   }
 
@@ -1341,7 +1345,10 @@ public final class FaceLockActivity extends Activity
   /** Everything the worker measured on one frame; consumed on the UI thread. */
   private static final class FrameResult {
     long tMs;
+    /** Eye-aligned scale-1.0 descriptor, used for enrolment and pose. */
     FaceTemplate template;
+    /** Best-scale descriptor for identity; falls back to {@link #template}. */
+    FaceTemplate identityTemplate;
     FaceSignals signals;
     boolean facePresent;
     boolean multiFace;
@@ -1400,6 +1407,51 @@ public final class FaceLockActivity extends Activity
                 cropX, cropY, cropSide);
             result.signals = FaceSignals.fromFrame(frame, width, height, rotation,
                 cropX, cropY, cropSide);
+
+            // Snap the descriptor crop to the measured eye pair. The locked
+            // crop keeps the liveness geometry stable, but for identity a
+            // small detector offset or a few percent of scale error costs
+            // real similarity. Re-anchoring on the landmarks makes the same
+            // face land in the same 48×48 grid on every frame. The scan also
+            // tries two nearby scales and keeps whichever resembles the
+            // enrolled face most, absorbing residual eye-distance error.
+            int uprightWidth = (rotation == 90 || rotation == 270) ? height : width;
+            int uprightHeight = (rotation == 90 || rotation == 270) ? width : height;
+            FaceTemplate.FaceCrop eyeCrop = null;
+            if (result.signals != null && result.signals.eyesFound) {
+              eyeCrop = FaceTemplate.cropFromEyes(
+                  result.signals.eyeMidX, result.signals.eyeMidY, result.signals.eyeGap,
+                  cropX, cropY, cropSide, uprightWidth, uprightHeight);
+              FaceTemplate aligned = FaceTemplate.fromFrame(frame, width, height, rotation,
+                  eyeCrop.centerX, eyeCrop.centerY, eyeCrop.side);
+              if (aligned != null && aligned.isUsable()) {
+                result.template = aligned;
+              } else {
+                eyeCrop = null;
+              }
+            }
+            if (eyeCrop != null && !enrollMode && !enrolledSnapshot.isEmpty()) {
+              FaceTemplate best = result.template;
+              float bestScore = best != null
+                  ? best.similarity(enrolledSnapshot.get(0)) : -1f;
+              float[] scaleSteps = {0.94f, 1.06f};
+              for (float scaleStep : scaleSteps) {
+                FaceTemplate.FaceCrop scaledCrop =
+                    eyeCrop.scaled(scaleStep, uprightWidth, uprightHeight);
+                FaceTemplate candidate = FaceTemplate.fromFrame(frame, width, height,
+                    rotation, scaledCrop.centerX, scaledCrop.centerY, scaledCrop.side);
+                if (candidate == null || !candidate.isUsable()) continue;
+                float score = candidate.similarity(enrolledSnapshot.get(0));
+                if (best == null || score > bestScore) {
+                  best = candidate;
+                  bestScore = score;
+                }
+              }
+              result.identityTemplate = best;
+            } else {
+              result.identityTemplate = result.template;
+            }
+
             if (!locked && faceCropValid && now - faceCropAtMs <= FACE_CROP_MAX_AGE_MS) {
               // Validate the detector-framed crop before the UI locks it:
               // it must contain a usable descriptor and locatable eyes.
@@ -1419,15 +1471,25 @@ public final class FaceLockActivity extends Activity
             result.multiFace = detectorRecent && detectorMulti;
             result.facePresent = (detectorRecent && detectorOk)
                 || (result.signals != null && result.signals.geometryLooksLikeFace());
-            if (result.template != null && !enrolledSnapshot.isEmpty()) {
-              result.simStraight = result.template.similarity(enrolledSnapshot.get(0));
-              result.simLeft = enrolledSnapshot.size() > 1
-                  ? result.template.similarity(enrolledSnapshot.get(1))
-                  : result.simStraight;
-              result.simRight = enrolledSnapshot.size() > 2
-                  ? result.template.similarity(enrolledSnapshot.get(2))
-                  : result.simStraight;
-              result.strictStraight = result.template.matchesStrict(enrolledSnapshot.get(0));
+            if (!enrolledSnapshot.isEmpty()) {
+              // Identity and pose use different crops on purpose: identity
+              // wants the eye-aligned, best-scale crop, while pose evidence
+              // for turns compares the same eye-aligned scale on both sides.
+              FaceTemplate identity = result.identityTemplate != null
+                  ? result.identityTemplate : result.template;
+              FaceTemplate pose = result.template != null ? result.template : identity;
+              if (identity != null) {
+                result.simStraight = identity.similarity(enrolledSnapshot.get(0));
+                result.strictStraight = identity.matchesStrict(enrolledSnapshot.get(0));
+              }
+              if (pose != null) {
+                result.simLeft = enrolledSnapshot.size() > 1
+                    ? pose.similarity(enrolledSnapshot.get(1))
+                    : result.simStraight;
+                result.simRight = enrolledSnapshot.size() > 2
+                    ? pose.similarity(enrolledSnapshot.get(2))
+                    : result.simStraight;
+              }
             }
           } catch (RuntimeException ignored) {
             // A malformed buffer must never crash the scan; the next frame
@@ -1565,11 +1627,12 @@ public final class FaceLockActivity extends Activity
           // interpupillary distance so the descriptor sees the same face
           // scale whether the phone is close or far away, and its centre sits
           // a little below the eyes (the eye midpoint is not the face centre).
-          float sidePixels = eyeDistance * FACE_CROP_EYE_RATIO;
+          float sidePixels = eyeDistance * FaceTemplate.EYE_CROP_RATIO;
           float targetShort = Math.min(targetWidth, targetHeight);
-          float sideFraction = clampFloat(sidePixels / targetShort, 0.40f, 0.98f);
+          float sideFraction = clampFloat(sidePixels / targetShort,
+              FaceTemplate.MIN_CROP_SIDE, FaceTemplate.MAX_CROP_SIDE);
           float centerX = midpoint.x / (float) targetWidth;
-          float centerY = (midpoint.y + sidePixels * FACE_CROP_EYE_OFFSET)
+          float centerY = (midpoint.y + sidePixels * FaceTemplate.EYE_CROP_OFFSET)
               / (float) targetHeight;
           float uprightShort = Math.min(uprightWidth, uprightHeight);
           float halfX = sideFraction * uprightShort / (2f * uprightWidth);
@@ -1615,6 +1678,7 @@ public final class FaceLockActivity extends Activity
     sessionCropGeneration = analysisCropGeneration;
     sessionSawFace = false;
     lastChallengeShown = -1;
+    lastGuidance = LivenessSession.Guidance.NONE;
   }
 
   private void onUnlockFrame(FrameResult result) {
@@ -1653,7 +1717,9 @@ public final class FaceLockActivity extends Activity
     if (wasAsking && !faceAskShown) {
       overlay.setState(OverlayMode.ACTIVE, session.getProgress(), cueForSession());
     }
-    if (result.template == null || !result.template.isUsable()) {
+    FaceTemplate identityTemplate = result.identityTemplate != null
+        ? result.identityTemplate : result.template;
+    if (identityTemplate == null || !identityTemplate.isUsable()) {
       LivenessSession.Frame cold = new LivenessSession.Frame();
       cold.tMs = result.tMs;
       cold.usable = false;
@@ -1691,6 +1757,12 @@ public final class FaceLockActivity extends Activity
     }
   }
 
+  /**
+   * Keeps the panel in step with the state machine. The wording is
+   * deliberately concrete — which way, how far, what happens next — because
+   * the prompts are randomized and a vague "follow the prompts" is where
+   * most genuine unlock attempts used to stall.
+   */
   private void syncSessionUi(FrameResult result) {
     if (faceAskShown && !result.facePresent) {
       showFaceAsk();
@@ -1698,42 +1770,140 @@ public final class FaceLockActivity extends Activity
     }
     LivenessSession.Phase phase = session.getPhase();
     int done = session.getChallengesDone();
+    int total = session.getChallengesTotal();
     if (done != lastChallengeShown && phase != LivenessSession.Phase.BASELINE) {
       if (lastChallengeShown >= 0) haptic(HapticFeedbackConstants.VIRTUAL_KEY);
       lastChallengeShown = done;
     }
     overlay.setState(OverlayMode.ACTIVE, session.getProgress(), cueForSession());
+    overlay.setHoldProgress(session.getChallengeProgress());
     if (phase == LivenessSession.Phase.BASELINE) {
       stepView.setText(revealMode ? "LIVE FACE CHECK" : "FACE UNLOCK");
       captureProgress.setText("");
       if (!result.facePresent) {
-        setStatus("Center your face", "Fit your whole face inside the oval.");
+        setStatus("Center your face",
+            "Fit your whole face inside the oval, then hold still.");
       } else {
-        setStatus("Looking for your face",
-            "Look straight at the camera and hold still for a moment.");
+        setStatus("Look straight at the camera",
+            "Hold still while I check it's you. Three quick prompts follow — "
+                + "they change every time.");
       }
       return;
     }
-    stepView.setText("LIVE CHECK · " + done + " OF " + session.getChallengesTotal());
-    captureProgress.setText(sessionDots(done, session.getChallengesTotal()));
     if (phase == LivenessSession.Phase.RETURN_CENTER) {
-      setStatus("Look straight again", "Face the camera directly.");
+      stepView.setText("STEP " + Math.min(done + 1, total) + " OF " + total);
+      captureProgress.setText(sessionDots(done, total));
+      setStatus("Nice — back to the center",
+          "Look straight at the camera. The next prompt starts once you are centered.");
       return;
     }
     if (phase == LivenessSession.Phase.FINAL_CONFIRM) {
-      setStatus("Hold still", "Finishing the check…");
+      stepView.setText("FINAL CHECK");
+      captureProgress.setText(sessionDots(total, total));
+      setStatus("Almost there — hold still",
+          "Keep your face centered while I confirm the match.");
       return;
     }
     LivenessSession.Challenge challenge = session.getCurrentChallenge();
-    if (challenge == LivenessSession.Challenge.BLINK) {
-      setStatus("Blink slowly", "Close both eyes, then open them.");
-    } else if (challenge == LivenessSession.Challenge.TURN_LEFT) {
-      setStatus("Turn your head left", "Turn slowly to your left and hold.");
-    } else if (challenge == LivenessSession.Challenge.TURN_RIGHT) {
-      setStatus("Turn your head right", "Turn slowly to your right and hold.");
-    } else if (challenge == LivenessSession.Challenge.NOD_DOWN) {
-      setStatus("Nod down", "Dip your chin down slowly and hold.");
+    if (challenge == null) return;
+    LivenessSession.Guidance guidance = session.getGuidance();
+    if (guidance != lastGuidance) {
+      // A short tick the moment the pose is accepted tells the user to keep
+      // holding, without looking away from the camera to read the panel.
+      if (guidance == LivenessSession.Guidance.HOLD) {
+        haptic(HapticFeedbackConstants.VIRTUAL_KEY);
+      }
+      lastGuidance = guidance;
     }
+    stepView.setText("STEP " + Math.min(done + 1, total) + " OF " + total);
+    int held = session.getHoldFrames();
+    captureProgress.setText(sessionDots(done, total)
+        + (held > 0 ? "   " + holdBar(held) : ""));
+
+    if (guidance == LivenessSession.Guidance.RETRY_CHALLENGE) {
+      setStatus("Let's try that again",
+          "No rush — " + challengeAction(challenge));
+      return;
+    }
+    if (challenge == LivenessSession.Challenge.BLINK) {
+      if (guidance == LivenessSession.Guidance.EYES_CLOSED) {
+        setStatus("Now open your eyes",
+            "Open both eyes and look at the camera to finish the blink.");
+      } else {
+        setStatus("Blink slowly",
+            "Close both eyes for a moment, then open them. Keep your face in the oval.");
+      }
+      return;
+    }
+    if (challenge == LivenessSession.Challenge.TURN_LEFT) {
+      if (guidance == LivenessSession.Guidance.WRONG_DIRECTION) {
+        setStatus("Other way — to your left",
+            "Turn toward your left shoulder, the side your left hand is on. "
+                + "The preview is mirrored, so the arrows point right.");
+      } else if (guidance == LivenessSession.Guidance.TURN_MORE) {
+        setStatus("A little more to your left",
+            "Keep turning slowly. A green ring fills while you hold the pose.");
+      } else if (guidance == LivenessSession.Guidance.HOLD) {
+        setStatus("Hold it there — to your left",
+            "Stay turned and keep looking at the screen. Hold until the ring is full.");
+      } else {
+        setStatus("Turn to your left",
+            "Turn your head slowly toward your left shoulder, then hold it there.");
+      }
+      return;
+    }
+    if (challenge == LivenessSession.Challenge.TURN_RIGHT) {
+      if (guidance == LivenessSession.Guidance.WRONG_DIRECTION) {
+        setStatus("Other way — to your right",
+            "Turn toward your right shoulder, the side your right hand is on. "
+                + "The preview is mirrored, so the arrows point left.");
+      } else if (guidance == LivenessSession.Guidance.TURN_MORE) {
+        setStatus("A little more to your right",
+            "Keep turning slowly. A green ring fills while you hold the pose.");
+      } else if (guidance == LivenessSession.Guidance.HOLD) {
+        setStatus("Hold it there — to your right",
+            "Stay turned and keep looking at the screen. Hold until the ring is full.");
+      } else {
+        setStatus("Turn to your right",
+            "Turn your head slowly toward your right shoulder, then hold it there.");
+      }
+      return;
+    }
+    if (guidance == LivenessSession.Guidance.WRONG_DIRECTION) {
+      setStatus("Chin down, not up",
+          "Dip your chin toward your chest, then hold so the ring can fill.");
+    } else if (guidance == LivenessSession.Guidance.TURN_MORE) {
+      setStatus("A little further down",
+          "Keep lowering your chin slowly. A green ring fills while you hold.");
+    } else if (guidance == LivenessSession.Guidance.HOLD) {
+      setStatus("Hold it there — chin down",
+          "Keep your chin dipped and look at the screen. Hold until the ring is full.");
+    } else {
+      setStatus("Nod your chin down",
+          "Dip your chin toward your chest slowly, then hold it there.");
+    }
+  }
+
+  /** One short, direct sentence for the retry panel. */
+  private String challengeAction(LivenessSession.Challenge challenge) {
+    if (challenge == LivenessSession.Challenge.BLINK) {
+      return "close both eyes for a moment, then open them.";
+    }
+    if (challenge == LivenessSession.Challenge.TURN_LEFT) {
+      return "turn your head toward your left shoulder and hold.";
+    }
+    if (challenge == LivenessSession.Challenge.TURN_RIGHT) {
+      return "turn your head toward your right shoulder and hold.";
+    }
+    return "dip your chin toward your chest and hold.";
+  }
+
+  private String holdBar(int held) {
+    StringBuilder bar = new StringBuilder();
+    for (int i = 0; i < LivenessSession.HOLD_FRAMES; i++) {
+      bar.append(i < held ? '■' : '□');
+    }
+    return bar.toString();
   }
 
   private String sessionDots(int done, int total) {
@@ -1825,7 +1995,9 @@ public final class FaceLockActivity extends Activity
       instruction = "Keep your whole face inside the oval until the check finishes.";
     } else {
       status = "That took too long";
-      instruction = "Follow each prompt as it appears. The order is different every time.";
+      instruction = "Follow each prompt as it appears. A missed prompt is repeated "
+          + "once — if it is missed again the attempt ends. The order is different "
+          + "every time.";
     }
     captureProgress.setText("");
     setStatus(status, instruction);
@@ -1857,7 +2029,7 @@ public final class FaceLockActivity extends Activity
     }
     WindowManager.LayoutParams params = getWindow().getAttributes();
     float targetBrightness = flash ? 1.0f : fill ? 0.85f
-        : WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
+              : WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
     if (params.screenBrightness != targetBrightness) {
       params.screenBrightness = targetBrightness;
       getWindow().setAttributes(params);
@@ -1903,13 +2075,17 @@ public final class FaceLockActivity extends Activity
     private final Paint ringTrack = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint cuePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint cueFill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint checkPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint holdPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF oval = new RectF();
     private final RectF ringOval = new RectF();
+    private final RectF holdOval = new RectF();
     private final Path path = new Path();
     private OverlayMode mode = OverlayMode.ACTIVE;
     private OverlayCue cue = OverlayCue.NONE;
     private float progress;
+    private float holdProgress;
 
     FaceOverlay(Activity activity) {
       super(activity);
@@ -1927,16 +2103,32 @@ public final class FaceLockActivity extends Activity
       cuePaint.setStyle(Paint.Style.STROKE);
       cuePaint.setStrokeCap(Paint.Cap.ROUND);
       cuePaint.setStrokeJoin(Paint.Join.ROUND);
+      cueFill.setStyle(Paint.Style.FILL);
+      cueFill.setColor(COLOR_PRIMARY);
       checkPaint.setStyle(Paint.Style.STROKE);
       checkPaint.setStrokeCap(Paint.Cap.ROUND);
       checkPaint.setStrokeJoin(Paint.Join.ROUND);
+      holdPaint.setStyle(Paint.Style.STROKE);
+      holdPaint.setStrokeCap(Paint.Cap.ROUND);
+      holdPaint.setStrokeWidth(dp(5));
+      holdPaint.setColor(0xFF34C77B);
     }
 
     void setState(OverlayMode newMode, float newProgress, OverlayCue newCue) {
       mode = newMode;
       progress = Math.max(0f, Math.min(1f, newProgress));
       cue = newCue;
+      if (newMode != OverlayMode.ACTIVE) holdProgress = 0f;
       invalidate();
+    }
+
+    /** 0..1 fill of the green "hold this pose" ring around the oval. */
+    void setHoldProgress(float value) {
+      float clamped = Math.max(0f, Math.min(1f, value));
+      if (Math.abs(clamped - holdProgress) > 0.001f) {
+        holdProgress = clamped;
+        invalidate();
+      }
     }
 
     @Override protected void onDraw(Canvas canvas) {
@@ -1995,8 +2187,25 @@ public final class FaceLockActivity extends Activity
       }
       if (mode != OverlayMode.ACTIVE) return;
 
+      // Green fill around the oval while a turn or nod pose is held. This is
+      // direct feedback that the app has seen the movement; without it a
+      // user who was almost there saw nothing change for several seconds.
+      if (holdProgress > 0.02f) {
+        holdOval.set(oval);
+        holdOval.inset(dp(4), dp(4));
+        canvas.drawArc(holdOval, -90f, 360f * holdProgress, false, holdPaint);
+      }
+
+      // Cues breathe gently so the eye is drawn to the direction to move
+      // without the whole preview animating.
+      long now = SystemClock.uptimeMillis();
+      float pulse = 0.62f + 0.38f * (0.5f + 0.5f * (float) Math.sin(now / 240.0));
+      int cueAlpha = (int) (255f * pulse);
       cuePaint.setColor(COLOR_PRIMARY);
       cuePaint.setStrokeWidth(dp(4));
+      cuePaint.setAlpha(cueAlpha);
+      cueFill.setColor(COLOR_PRIMARY);
+      cueFill.setAlpha(cueAlpha);
       float chevron = dp(11);
       if (cue == OverlayCue.TURN_USER_LEFT) {
         // Nose moves towards the right edge of the mirrored preview.
@@ -2009,16 +2218,43 @@ public final class FaceLockActivity extends Activity
         drawChevron(canvas, cx, oval.bottom + dp(18), chevron, 0, 1);
         drawChevron(canvas, cx, oval.bottom + dp(32), chevron, 0, 1);
       } else if (cue == OverlayCue.BLINK) {
-        float eyeY = oval.top - dp(26);
+        float eyeY = Math.max(oval.top - dp(26),
+            (topBarView != null ? topBarView.getBottom() : 0) + dp(26));
+        drawBlinkCue(canvas, cx, eyeY);
+      }
+    }
+
+    /**
+     * Two eyes that close and open on a slow loop, demonstrating the blink
+     * instead of describing it. Drawn above the oval.
+     */
+    private void drawBlinkCue(Canvas canvas, float cx, float eyeY) {
+      long now = SystemClock.uptimeMillis();
+      float cycle = (now % 2400L) / 2400f;
+      float open;
+      if (cycle < 0.55f) {
+        open = 1f;
+      } else if (cycle < 0.68f) {
+        open = 1f - (cycle - 0.55f) / 0.13f;
+      } else if (cycle < 0.78f) {
+        open = 0f;
+      } else if (cycle < 0.90f) {
+        open = (cycle - 0.78f) / 0.12f;
+      } else {
+        open = 1f;
+      }
+      float lid = dp(1.2f) + dp(11) * open;
+      for (int side = -1; side <= 1; side += 2) {
+        float ex = cx + side * dp(18);
         path.reset();
-        path.moveTo(cx - dp(17), eyeY);
-        path.quadTo(cx, eyeY - dp(13), cx + dp(17), eyeY);
-        path.quadTo(cx, eyeY + dp(13), cx - dp(17), eyeY);
+        path.moveTo(ex - dp(13), eyeY);
+        path.quadTo(ex, eyeY - lid, ex + dp(13), eyeY);
+        path.quadTo(ex, eyeY + lid, ex - dp(13), eyeY);
         path.close();
         canvas.drawPath(path, cuePaint);
-        cuePaint.setStyle(Paint.Style.FILL);
-        canvas.drawCircle(cx, eyeY, dp(4), cuePaint);
-        cuePaint.setStyle(Paint.Style.STROKE);
+        if (open > 0.45f) {
+          canvas.drawCircle(ex, eyeY, dp(2.6f), cueFill);
+        }
       }
     }
 
