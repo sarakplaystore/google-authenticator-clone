@@ -7,78 +7,58 @@ import android.security.keystore.KeyProperties;
 import android.util.Base64;
 import java.nio.charset.Charset;
 import java.security.KeyStore;
-import java.security.MessageDigest;
-import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
-import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.GCMParameterSpec;
-import javax.crypto.spec.PBEKeySpec;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
- * Encrypted-at-rest storage for the locally enrolled face templates and the
- * backup PIN. Face descriptors never leave the device and are protected by a
- * key held in the Android Keystore.
+ * Encrypted-at-rest storage for the locally enrolled face templates. Face
+ * descriptors never leave the device and are protected by a key held in the
+ * Android Keystore.
+ *
+ * <p>The six-digit backup PIN was removed from the app. Data written by an
+ * older version is migrated in place: the leftover PIN hash is dropped the
+ * next time the payload is read, and its throttling state is cleared when
+ * this store is created.</p>
  */
 public final class FaceStore {
   private static final String PREFS = "face_lock_private";
   private static final String DATA = "encrypted_face_v1";
   private static final String KEY_ALIAS = "openauthenticator.face.v1";
-  private static final String PIN_FAILURES = "pin_failures";
-  private static final String PIN_BLOCKED_UNTIL = "pin_blocked_until";
   private static final String FACE_FAILURES = "face_failures";
   private static final String FACE_BLOCKED_UNTIL = "face_blocked_until";
-  /** Consecutive invalid face scans; reset by a successful unlock. */
-  private static final String INVALID_FACE_SCANS = "invalid_face_scans";
-  private static final String PIN_REMOVED_BY_FAILURES = "pin_removed_by_failures";
-  private static final int MAX_PIN_FAILURES = 5;
-  private static final long PIN_COOLDOWN_MS = 30000L;
+  /** Set once the state belonging to the removed backup PIN has been erased. */
+  private static final String LEGACY_PIN_CLEANED = "backup_pin_removed";
+  /** Preference keys written by builds that still had a backup PIN. */
+  private static final String[] LEGACY_PIN_PREFERENCES = {
+      "pin_failures", "pin_blocked_until", "invalid_face_scans", "pin_removed_by_failures"
+  };
   private static final int MAX_FACE_FAILURES = 5;
   private static final long FACE_COOLDOWN_MS = 30000L;
-  /**
-   * Once more than this many face scans in a row fail, the backup PIN is
-   * deleted. The face templates stay, so the owner can still unlock with a
-   * successful live scan (and can then set a new PIN in the settings).
-   */
-  public static final int MAX_INVALID_SCANS = 20;
   private static final String FORMAT_VERSION = "1";
   private static final Charset UTF8 = Charset.forName("UTF-8");
-  private static final int PIN_ITERATIONS = 60000;
-  private static final int PIN_BITS = 128;
-  private static final int SALT_BYTES = 16;
-  private static final SecureRandom RANDOM = new SecureRandom();
 
   private final SharedPreferences preferences;
 
   public FaceStore(Context context) {
     preferences = context.getApplicationContext()
         .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    removeLegacyPinState();
   }
 
   /**
-   * True once face templates exist. A missing backup PIN (for example after
-   * the invalid-scan limit removed it, or for an old registration) does not
-   * make the app "unenrolled": face unlock must keep working so the owner can
-   * get back in and set a new PIN.
+   * True once face templates exist. The backup PIN never decided whether the
+   * app was enrolled: a successful live scan is the only way in.
    */
   public synchronized boolean isEnrolled() {
     try {
       Payload payload = read();
       return payload != null && !payload.templates.isEmpty();
-    } catch (RuntimeException e) {
-      return false;
-    }
-  }
-
-  public synchronized boolean hasPin() {
-    try {
-      Payload payload = read();
-      return payload != null && payload.pinHash != null;
     } catch (RuntimeException e) {
       return false;
     }
@@ -90,96 +70,23 @@ public final class FaceStore {
     return new ArrayList<FaceTemplate>(payload.templates);
   }
 
-  public synchronized void saveEnrollment(List<FaceTemplate> templates, String pin) {
-    if (templates == null || templates.isEmpty()) {
-      throw new IllegalArgumentException("Face registration did not finish.");
-    }
-    String problem = pinProblem(pin);
-    if (problem != null) {
-      throw new IllegalArgumentException(problem);
-    }
-    Payload payload = new Payload();
-    payload.templates.clear();
-    payload.templates.addAll(templates);
-    setPin(payload, pin);
-    write(payload);
-    resetPinRemovalState();
-  }
-
+  /** Stores a finished face registration, replacing any earlier templates. */
   public synchronized void saveTemplates(List<FaceTemplate> templates) {
     if (templates == null || templates.isEmpty()) {
       throw new IllegalArgumentException("Face registration did not finish.");
     }
     Payload payload = read();
-    if (payload == null || payload.pinHash == null) {
-      throw new IllegalStateException("No backup PIN is set up yet.");
-    }
+    if (payload == null) payload = new Payload();
     payload.templates.clear();
     payload.templates.addAll(templates);
     write(payload);
   }
 
-  public synchronized void updatePin(String pin) {
-    String problem = pinProblem(pin);
-    if (problem != null) {
-      throw new IllegalArgumentException(problem);
-    }
-    Payload payload = read();
-    if (payload == null || payload.templates.isEmpty()) {
-      throw new IllegalStateException("Register your face before setting a PIN.");
-    }
-    setPin(payload, pin);
-    write(payload);
-    resetPinRemovalState();
-  }
-
-  public synchronized boolean verifyPin(String pin) {
-    if (pin == null) return false;
-    Payload payload = read();
-    if (payload == null || payload.pinHash == null || payload.pinSalt == null) return false;
-    byte[] candidate = hashPin(pin, payload.pinSalt, payload.pinIterations);
-    return MessageDigest.isEqual(candidate, payload.pinHash);
-  }
-
-  /** PIN throttling is persisted so force-stopping the app does not reset it. */
-  public synchronized boolean isPinBlocked() {
-    long until = preferences.getLong(PIN_BLOCKED_UNTIL, 0L);
-    if (until == 0L) return false;
-    if (System.currentTimeMillis() >= until) {
-      preferences.edit().remove(PIN_BLOCKED_UNTIL).remove(PIN_FAILURES).commit();
-      return false;
-    }
-    return true;
-  }
-
-  public synchronized int pinCooldownSeconds() {
-    if (!isPinBlocked()) return 0;
-    long remaining = preferences.getLong(PIN_BLOCKED_UNTIL, 0L) - System.currentTimeMillis();
-    return Math.max(1, (int) Math.ceil(remaining / 1000.0));
-  }
-
-  public synchronized void recordPinFailure() {
-    if (isPinBlocked()) return;
-    int failures = preferences.getInt(PIN_FAILURES, 0) + 1;
-    if (failures >= MAX_PIN_FAILURES) {
-      preferences.edit()
-          .putLong(PIN_BLOCKED_UNTIL, System.currentTimeMillis() + PIN_COOLDOWN_MS)
-          .remove(PIN_FAILURES)
-          .commit();
-    } else {
-      preferences.edit().putInt(PIN_FAILURES, failures).commit();
-    }
-  }
-
-  public synchronized void clearPinFailures() {
-    preferences.edit().remove(PIN_FAILURES).remove(PIN_BLOCKED_UNTIL).commit();
-  }
-
   /**
-   * Face attempts are throttled like the PIN: after five failed scans
-   * (timeouts, wrong faces, or suspected spoofs) the camera scan pauses for
-   * a cooldown and only the PIN works. Persisted so force-stopping the app
-   * does not reset it. Walking away mid-scan does not count as a failure.
+   * Face attempts are throttled: after five failed scans (timeouts, wrong
+   * faces, or suspected spoofs) the camera scan pauses for a cooldown.
+   * Persisted so force-stopping the app does not reset it. Walking away
+   * mid-scan does not count as a failure.
    */
   public synchronized boolean isFaceBlocked() {
     long until = preferences.getLong(FACE_BLOCKED_UNTIL, 0L);
@@ -197,141 +104,41 @@ public final class FaceStore {
     return Math.max(1, (int) Math.ceil(remaining / 1000.0));
   }
 
-  /**
-   * Records one failed face attempt and returns true when this attempt
-   * exceeded {@link #MAX_INVALID_SCANS} and deleted the backup PIN.
-   *
-   * <p>The invalid-scan counter is separate from the short cooldown counter:
-   * it survives cooldowns and app restarts, and only a successful unlock
-   * resets it. Deleting the PIN fails closed: the face templates are kept,
-   * but there is no PIN left to fall back to until the owner passes a face
-   * scan and sets a new one.</p>
-   */
-  public synchronized boolean recordFaceFailure() {
-    if (!isFaceBlocked()) {
-      int failures = preferences.getInt(FACE_FAILURES, 0) + 1;
-      if (failures >= MAX_FACE_FAILURES) {
-        preferences.edit()
-            .putLong(FACE_BLOCKED_UNTIL, System.currentTimeMillis() + FACE_COOLDOWN_MS)
-            .remove(FACE_FAILURES)
-            .commit();
-      } else {
-        preferences.edit().putInt(FACE_FAILURES, failures).commit();
-      }
+  /** Records one failed face attempt towards the short scan cooldown. */
+  public synchronized void recordFaceFailure() {
+    if (isFaceBlocked()) return;
+    int failures = preferences.getInt(FACE_FAILURES, 0) + 1;
+    if (failures >= MAX_FACE_FAILURES) {
+      preferences.edit()
+          .putLong(FACE_BLOCKED_UNTIL, System.currentTimeMillis() + FACE_COOLDOWN_MS)
+          .remove(FACE_FAILURES)
+          .commit();
+    } else {
+      preferences.edit().putInt(FACE_FAILURES, failures).commit();
     }
-    int invalid = preferences.getInt(INVALID_FACE_SCANS, 0) + 1;
-    preferences.edit().putInt(INVALID_FACE_SCANS, invalid).commit();
-    if (invalid > MAX_INVALID_SCANS) {
-      return removeBackupPinAfterFailures();
-    }
-    return false;
   }
 
-  /** Clears the state that belongs to the PIN that was just (re)created. */
-  private void resetPinRemovalState() {
-    preferences.edit()
-        .remove(PIN_REMOVED_BY_FAILURES)
-        .remove(INVALID_FACE_SCANS)
-        .commit();
-  }
-
-  /** Number of consecutive failed face scans recorded so far. */
-  public synchronized int invalidScanCount() {
-    return preferences.getInt(INVALID_FACE_SCANS, 0);
-  }
-
-  /** Failed scans left before the backup PIN is removed (0 when already gone). */
-  public synchronized int scansUntilPinRemoval() {
-    if (!hasPin()) return 0;
-    return Math.max(0, MAX_INVALID_SCANS + 1 - invalidScanCount());
-  }
-
-  /** True when the backup PIN was deleted because of repeated failed scans. */
-  public synchronized boolean wasPinRemovedByFailures() {
-    return preferences.getBoolean(PIN_REMOVED_BY_FAILURES, false);
-  }
-
-  /** A successful authentication resets both the cooldown and invalid count. */
+  /** A successful authentication resets the cooldown. */
   public synchronized void clearFaceFailures() {
     preferences.edit()
         .remove(FACE_FAILURES)
         .remove(FACE_BLOCKED_UNTIL)
-        .remove(INVALID_FACE_SCANS)
         .commit();
   }
 
   /**
-   * Deletes only the PIN hash/salt from the encrypted payload. Face templates
-   * remain enrolled. Any storage failure is swallowed (and retried on the
-   * next failed attempt) because this runs on the scan screen and must never
-   * crash it.
+   * The backup PIN is gone. Clear any PIN throttling state left by an older
+   * install so it cannot accumulate forever. The stored hash itself is
+   * dropped by {@link #read()} when the encrypted payload is next opened.
    */
-  private boolean removeBackupPinAfterFailures() {
-    try {
-      Payload payload = read();
-      if (payload == null || payload.pinHash == null) return false;
-      payload.pinHash = null;
-      payload.pinSalt = null;
-      write(payload);
-      preferences.edit()
-          .putBoolean(PIN_REMOVED_BY_FAILURES, true)
-          .remove(PIN_FAILURES)
-          .remove(PIN_BLOCKED_UNTIL)
-          .commit();
-      return true;
-    } catch (RuntimeException e) {
-      return false;
+  private void removeLegacyPinState() {
+    if (preferences.getBoolean(LEGACY_PIN_CLEANED, false)) return;
+    SharedPreferences.Editor editor = preferences.edit()
+        .putBoolean(LEGACY_PIN_CLEANED, true);
+    for (String key : LEGACY_PIN_PREFERENCES) {
+      editor.remove(key);
     }
-  }
-
-  /** Returns an explanation when a PIN is weak or malformed, or null when it is fine. */
-  public static String pinProblem(String pin) {
-    if (pin == null || pin.length() != 6) {
-      return "Enter a 6-digit PIN.";
-    }
-    boolean allSame = true;
-    boolean ascending = true;
-    boolean descending = true;
-    for (int i = 0; i < pin.length(); i++) {
-      char ch = pin.charAt(i);
-      if (ch < '0' || ch > '9') {
-        return "Your PIN can only contain numbers.";
-      }
-      if (i > 0) {
-        char previous = pin.charAt(i - 1);
-        if (ch != previous) allSame = false;
-        if (ch != previous + 1) ascending = false;
-        if (ch != previous - 1) descending = false;
-      }
-    }
-    if (allSame) {
-      return "Choose a PIN that is not the same digit repeated.";
-    }
-    if (ascending || descending) {
-      return "Avoid counting sequences for your PIN.";
-    }
-    return null;
-  }
-
-  private static void setPin(Payload payload, String pin) {
-    byte[] salt = new byte[SALT_BYTES];
-    RANDOM.nextBytes(salt);
-    payload.pinSalt = salt;
-    payload.pinIterations = PIN_ITERATIONS;
-    payload.pinHash = hashPin(pin, salt, PIN_ITERATIONS);
-  }
-
-  private static byte[] hashPin(String pin, byte[] salt, int iterations) {
-    PBEKeySpec spec = new PBEKeySpec(pin.toCharArray(), salt,
-        Math.max(1, iterations), PIN_BITS);
-    try {
-      SecretKeyFactory factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1");
-      return factory.generateSecret(spec).getEncoded();
-    } catch (Exception e) {
-      throw new IllegalStateException("The backup PIN could not be processed.", e);
-    } finally {
-      spec.clearPassword();
-    }
+    editor.apply();
   }
 
   private Payload read() {
@@ -352,12 +159,15 @@ public final class FaceStore {
           if (template != null) payload.templates.add(template);
         }
       }
-      String salt = root.optString("pin_salt", "");
-      String hash = root.optString("pin_hash", "");
-      if (salt.length() > 0 && hash.length() > 0) {
-        payload.pinSalt = Base64.decode(salt, Base64.DEFAULT);
-        payload.pinHash = Base64.decode(hash, Base64.DEFAULT);
-        payload.pinIterations = root.optInt("pin_iterations", PIN_ITERATIONS);
+      if (root.has("pin_salt") || root.has("pin_hash") || root.has("pin_iterations")) {
+        // An older version stored a backup-PIN hash here. The PIN feature is
+        // gone, so rewrite the payload without it. A failed rewrite must not
+        // make the enrolled face unreadable; the next read retries.
+        try {
+          write(payload);
+        } catch (RuntimeException ignored) {
+          // Best-effort migration only.
+        }
       }
       return payload;
     } catch (RuntimeException e) {
@@ -376,11 +186,6 @@ public final class FaceStore {
         array.put(Base64.encodeToString(template.toBytes(), Base64.NO_WRAP));
       }
       root.put("templates", array);
-      if (payload.pinSalt != null && payload.pinHash != null) {
-        root.put("pin_salt", Base64.encodeToString(payload.pinSalt, Base64.NO_WRAP));
-        root.put("pin_hash", Base64.encodeToString(payload.pinHash, Base64.NO_WRAP));
-        root.put("pin_iterations", payload.pinIterations);
-      }
       String encrypted = encrypt(root.toString().getBytes(UTF8));
       if (!preferences.edit().putString(DATA, encrypted).commit()) {
         throw new IllegalStateException("Face settings could not be saved.");
@@ -434,8 +239,5 @@ public final class FaceStore {
 
   private static final class Payload {
     final List<FaceTemplate> templates = new ArrayList<FaceTemplate>();
-    byte[] pinSalt;
-    byte[] pinHash;
-    int pinIterations = PIN_ITERATIONS;
   }
 }
