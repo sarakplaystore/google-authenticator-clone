@@ -17,6 +17,8 @@ import java.util.Random;
  * harness with a static photo, a rigidly moved photo (no parallax, no
  * blink), a moiré-covered screen replay that ignores the flash, a live
  * impostor, and a live owner whose face never responds to the screen light.
+ * Night scenarios run the same owner, photo and no-response cases at a
+ * fraction of the scene light, where raw-luma gates used to strand the scan.
  *
  * <p>Run after {@code ./build.sh}:</p>
  * <pre>
@@ -145,9 +147,48 @@ public final class LivenessVectors {
         "expected NO_LIGHT_RESPONSE, got " + darkResult.session.getFailReason());
     System.out.println("no light response rejected: NO_LIGHT_RESPONSE");
 
+    // Night: the live owner enrolled in daylight must still pass in a dark
+    // room, where the same frames used to fall below the quality and
+    // landmark gates and the scan dead-ended.
+    Scenario night = new Scenario(8);
+    night.light = 0.38f;
+    night.flashLift = 9;
+    Result nightResult = runScenario(night);
+    require(nightResult.session.isPassed(),
+        "night owner did not pass: " + nightResult.session.getPhase() + "/"
+            + nightResult.session.getFailReason() + " after " + nightResult.frames
+            + " frames, seq=" + nightResult.sequence);
+    System.out.println("night owner passed in " + nightResult.frames
+        + " frames, challenges " + nightResult.sequence);
+
+    // The light-response check stays armed after dark: a face that never
+    // brightens must still fail at night.
+    Scenario nightDark = new Scenario(9);
+    nightDark.light = 0.38f;
+    nightDark.flashResponsive = false;
+    Result nightDarkResult = runScenario(nightDark);
+    require(!nightDarkResult.session.isPassed(),
+        "a night face without a light response passed");
+    require(nightDarkResult.session.getFailReason()
+            == LivenessSession.FailReason.NO_LIGHT_RESPONSE,
+        "expected NO_LIGHT_RESPONSE at night, got "
+            + nightDarkResult.session.getFailReason());
+    System.out.println("night no-response rejected: NO_LIGHT_RESPONSE");
+
+    // A photo is still just a photo at night.
+    Scenario nightPhoto = new Scenario(10);
+    nightPhoto.light = 0.38f;
+    nightPhoto.staticPhoto = true;
+    Result nightPhotoResult = runScenario(nightPhoto);
+    require(!nightPhotoResult.session.isPassed(), "a static photo passed at night");
+    require(nightPhotoResult.session.getChallengesDone() == 0,
+        "a night photo completed a challenge: " + nightPhotoResult.sequence);
+    System.out.println("night static photo rejected: "
+        + nightPhotoResult.session.getFailReason());
+
     System.out.println("Passed liveness checks: live owner (5 random orders), "
         + "coaching (hold, wrong way, retry), static photo, rigid photo, "
-        + "screen replay, impostor, flash response.");
+        + "screen replay, impostor, flash response, night owner, night photo.");
   }
 
   // ------------------------------------------------------------- signal units
@@ -174,6 +215,24 @@ public final class LivenessVectors {
     require(shut.eyeOpenness < 0.62f * open.eyeOpenness,
         "blink openness dip too small: open=" + open.eyeOpenness
             + " closed=" + shut.eyeOpenness);
+
+    // The same measurements must survive a dark room: landmarks and the
+    // blink dip are contrast-normalised, so a night face keeps its eyes,
+    // mouth and openness range instead of falling off raw-luma cliffs.
+    Pose night = new Pose();
+    night.light = 0.25f;
+    FaceSignals nightSignals = signals(night);
+    require(nightSignals.eyesFound && nightSignals.mouthFound,
+        "night landmarks not found (luma " + nightSignals.meanLuma + ")");
+    require(nightSignals.geometryLooksLikeFace(), "night face failed geometry check");
+    Pose nightClosed = new Pose();
+    nightClosed.light = 0.25f;
+    nightClosed.closed = 1f;
+    FaceSignals nightShut = signals(nightClosed);
+    require(nightShut.eyesFound, "night closed-eye frame lost the eyes");
+    require(nightShut.eyeOpenness < 0.62f * nightSignals.eyeOpenness,
+        "night blink dip too small: open=" + nightSignals.eyeOpenness
+            + " closed=" + nightShut.eyeOpenness);
 
     Pose left = new Pose();
     left.yaw = 1f;
@@ -227,6 +286,10 @@ public final class LivenessVectors {
     boolean rigidPhoto;
     boolean moire;
     boolean flashResponsive = true;
+    /** Scene light level: 1 = full light, ~0.4 = a room at night. */
+    float light = 1f;
+    /** Raw luma rise the face shows while the screen flashes. */
+    int flashLift = 18;
     /** Deliberately turn the wrong way for the first turn prompt. */
     boolean mirrorFirstTurn;
     /** Ignore the first prompt for this long, to exercise the retry. */
@@ -265,6 +328,7 @@ public final class LivenessVectors {
     pose.variant = scenario.variant;
     pose.rigid = scenario.rigidPhoto;
     pose.moire = scenario.moire;
+    pose.light = scenario.light;
 
     LivenessSession.Challenge lastChallenge = null;
     int challengeFrames = 0;
@@ -306,7 +370,8 @@ public final class LivenessVectors {
         }
       }
       pose.seed = 1000L + frame;
-      pose.bright = scenario.flashResponsive && session.isFlashOn(t) ? 18 : 0;
+      pose.bright = scenario.flashResponsive && session.isFlashOn(t)
+          ? scenario.flashLift : 0;
 
       byte[] pixels = synth(pose);
       FaceTemplate template = FaceTemplate.fromFrame(pixels, W, H, 0);
@@ -386,6 +451,7 @@ public final class LivenessVectors {
     float closed;  // 0 open .. 1 shut
     boolean rigid; // flat-photo warp instead of per-feature 3D motion
     boolean moire;
+    float light = 1f; // scene light level: 1 = day, ~0.4 = night
     int bright;
     long seed = 7L;
   }
@@ -467,7 +533,10 @@ public final class LivenessVectors {
               * Math.sin(py * 2 * Math.PI / 11.0));
           value += 10f * (float) Math.sin((px * 0.8 + py) * 2 * Math.PI / 29.0);
         }
-        value += p.bright + (random.nextFloat() - 0.5f) * 6f;
+        // Scene light scales everything the room shows; the flash lift and
+        // the sensor's read noise sit on top, so a night frame carries the
+        // same structure at a lower level with relatively more noise.
+        value = value * p.light + p.bright + (random.nextFloat() - 0.5f) * 6f;
         pixels[py * W + px] = (byte) (int) Math.max(0, Math.min(255, value));
       }
     }

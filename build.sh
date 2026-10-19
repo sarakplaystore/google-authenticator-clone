@@ -147,8 +147,8 @@ sed 's#<manifest xmlns:android=#<manifest package="app.openauth.authenticator" x
   --java "$BUILD_DIR/generated" \
   --min-sdk-version 23 \
   --target-sdk-version 35 \
-  --version-code 8 \
-  --version-name 1.5.2 \
+  --version-code 9 \
+  --version-name 1.5.3 \
   --auto-add-overlay \
   -R "$BUILD_DIR/resources.zip"
 

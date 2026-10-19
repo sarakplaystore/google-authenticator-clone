@@ -36,7 +36,11 @@ public final class FaceTemplate {
    */
   public static final float STRICT_HOG_FLOOR = 0.76f;
   public static final float STRICT_THUMB_FLOOR = 0.80f;
-  /** Minimum usable quality; darker or flatter frames are rejected. */
+  /**
+   * Minimum usable quality. Frames with too little structural contrast
+   * (flat, crushed or pure noise) are rejected; dim but well-structured
+   * night frames score like their well-lit twins.
+   */
   public static final float MIN_QUALITY = 0.36f;
 
   private static final int SERIAL_VERSION = 1;
@@ -209,14 +213,20 @@ public final class FaceTemplate {
     variance /= weightSum;
     float std = (float) Math.sqrt(Math.max(0.0, variance));
 
-    float quality = Math.min(1f, std / 48f);
+    // Quality is structural contrast relative to the scene level, not raw
+    // contrast: the same face in a dark room has every luma difference
+    // scaled down with it, and used to fall below the gate at night while
+    // still matching perfectly well. Calibrated so a well-lit face (std≈43
+    // at mean≈113) scores exactly what the old raw std/48 formula gave it.
+    float quality = Math.min(1f, (float) (std / Math.max(mean, 16.0)) * 2.35f);
     // Only truly unusable exposures are penalised. A face lit mainly by the
     // screen can sit near 20/255 and is still perfectly matchable, so an
     // earlier, stricter bound rejected good scans in dim rooms.
     if (mean < 16.0 || mean > 240.0) {
       quality *= 0.55f;
     }
-    if (std < 5.0f) {
+    // Pure sensor noise has no structure to describe at any light level.
+    if (std < 2.0f) {
       quality = 0f;
     }
 

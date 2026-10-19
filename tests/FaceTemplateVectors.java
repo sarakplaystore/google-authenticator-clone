@@ -119,6 +119,33 @@ public final class FaceTemplateVectors {
     require(base.similarity(rotated) >= 0.97f,
         "rotation changed the descriptor too much: " + base.similarity(rotated));
 
+    // Night: the same face at a fraction of the light must stay usable and
+    // still match its well-lit enrolment. Quality is structural contrast
+    // relative to the scene, so a dark room no longer pushes the descriptor
+    // below the gate and strands the scan on "Move to better light".
+    byte[] nightFrame = dim(face(0, 1.0f, 0, 0, 0, 0), 0.45f);
+    FaceTemplate night = FaceTemplate.fromFrame(nightFrame, WIDTH, HEIGHT, 0);
+    require(night != null, "night descriptor was null");
+    require(night.isUsable(), "night descriptor was not usable: " + night.getQuality());
+    checkSame("night", base, night);
+    byte[] deepNightFrame = dim(face(0, 1.0f, 0, 0, 0, 0), 0.28f);
+    FaceTemplate deepNight = FaceTemplate.fromFrame(deepNightFrame, WIDTH, HEIGHT, 0);
+    require(deepNight != null, "deep-night descriptor was null");
+    require(deepNight.isUsable(),
+        "deep-night descriptor was not usable: " + deepNight.getQuality());
+    checkSame("deep night", base, deepNight);
+    FaceSignals nightSignals = FaceSignals.fromFrame(deepNightFrame, WIDTH, HEIGHT, 0);
+    require(nightSignals != null && nightSignals.eyesFound && nightSignals.mouthFound,
+        "deep-night landmarks not found");
+    for (int variant = 1; variant <= 6; variant++) {
+      FaceTemplate nightOther = FaceTemplate.fromFrame(
+          dim(face(0, 1.0f, 0, 0, 0, variant), 0.28f), WIDTH, HEIGHT, 0);
+      require(nightOther != null, "night impostor " + variant + " was null");
+      float score = base.similarity(nightOther);
+      require(score < FaceTemplate.MATCH_THRESHOLD,
+          "night impostor " + variant + " scored too high: " + score);
+    }
+
     byte[] dark = new byte[WIDTH * HEIGHT * 3 / 2];
     for (int i = 0; i < WIDTH * HEIGHT; i++) dark[i] = 10;
     FaceTemplate darkTemplate = FaceTemplate.fromFrame(dark, WIDTH, HEIGHT, 0);
@@ -280,6 +307,15 @@ public final class FaceTemplateVectors {
       }
     }
     return pixels;
+  }
+
+  /** Scales a frame's light level (1 = full brightness, ~0.3 = night). */
+  private static byte[] dim(byte[] frame, float scale) {
+    byte[] result = frame.clone();
+    for (int i = 0; i < WIDTH * HEIGHT; i++) {
+      result[i] = (byte) (int) Math.max(0, Math.min(255, (frame[i] & 0xff) * scale));
+    }
+    return result;
   }
 
   private static float distance(float x, float y, float cx, float cy) {
