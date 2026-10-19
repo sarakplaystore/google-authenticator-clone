@@ -7,6 +7,13 @@ package app.openauth.authenticator;
  * histogram-of-oriented-gradients grid. It is deliberately dependency-free so
  * that it can be unit tested on a plain JVM. No frame or image is ever stored;
  * only the numeric descriptor is kept, encrypted by {@link FaceStore}.</p>
+ *
+ * <p>The crop is anchored on the measured eye pair (see
+ * {@link #cropFromEyes}) rather than on a fixed place in the frame, so a face
+ * that sits a little higher, lower or closer on one day still lands in the
+ * same 48×48 grid on the next. That alignment, plus the ±1-cell shift search
+ * in {@link #similarity}, is what keeps genuine scans comfortable while an
+ * impostor stays below the match threshold.</p>
  */
 public final class FaceTemplate {
   /** Side of the normalised face crop used for feature extraction. */
@@ -50,6 +57,97 @@ public final class FaceTemplate {
   public static final float DEFAULT_CENTER_Y = 0.36f;
   /** Default crop side, as a fraction of the shorter upright frame side. */
   public static final float DEFAULT_SIDE = 0.72f;
+
+  /**
+   * Crop side around the eye pair, as a multiple of the interpupillary
+   * distance. The platform face detector and the landmark alignment below
+   * both use this number, so enrolment and unlock measure the same region of
+   * the face at the same scale.
+   */
+  public static final float EYE_CROP_RATIO = 3.2f;
+  /** Move the crop centre this far below the eye midpoint (crop side units). */
+  public static final float EYE_CROP_OFFSET = 0.10f;
+  /** Smallest/largest crop side ever used, as a fraction of the short side. */
+  public static final float MIN_CROP_SIDE = 0.40f;
+  public static final float MAX_CROP_SIDE = 0.98f;
+
+  /**
+   * A square face crop in upright-frame coordinates. Fields are fractions of
+   * the upright frame, like the crop arguments accepted by
+   * {@link #fromFrame(byte[], int, int, int, float, float, float)}.
+   */
+  public static final class FaceCrop {
+    public final float centerX;
+    public final float centerY;
+    public final float side;
+
+    public FaceCrop(float centerX, float centerY, float side) {
+      this.centerX = centerX;
+      this.centerY = centerY;
+      this.side = side;
+    }
+
+    /**
+     * Returns a copy of this crop with a different side, kept inside the
+     * frame. Used for the small scale search that absorbs residual error in
+     * the landmark-measured eye distance.
+     */
+    public FaceCrop scaled(float factor, int uprightWidth, int uprightHeight) {
+      float newSide = clamp(side * factor, 0.28f, 1.10f);
+      float shortSide = Math.min(uprightWidth, uprightHeight);
+      float halfX = newSide * shortSide / (2f * Math.max(1, uprightWidth));
+      float halfY = newSide * shortSide / (2f * Math.max(1, uprightHeight));
+      return new FaceCrop(
+          clamp(centerX, halfX, 1f - halfX),
+          clamp(centerY, halfY, 1f - halfY),
+          newSide);
+    }
+  }
+
+  /**
+   * Re-centres and rescales the descriptor crop on the eye pair measured by
+   * {@link FaceSignals} inside the scan's locked crop.
+   *
+   * <p>The detector-framed crop is a good first guess, but it follows the
+   * platform detector's midpoint, which drifts a little between frames and
+   * devices. Snapping the crop to the landmark eye pair removes that drift
+   * and the small scale error of the detector's eye-distance estimate, so the
+   * descriptor compares the same part of the face on every frame. This is a
+   * pure geometric mapping: it cannot turn one person's face into another's,
+   * it only makes the same face line up better.</p>
+   *
+   * @param eyeMidX eye midpoint inside the locked crop (0..1)
+   * @param eyeMidY eye midpoint inside the locked crop (0..1)
+   * @param eyeGap interpupillary distance inside the locked crop (0..1)
+   * @param cropCenterX centre of the crop the landmarks were measured in
+   * @param cropCenterY centre of the crop the landmarks were measured in
+   * @param cropSide side of the crop the landmarks were measured in
+   * @param uprightWidth width of the frame after rotation
+   * @param uprightHeight height of the frame after rotation
+   */
+  public static FaceCrop cropFromEyes(float eyeMidX, float eyeMidY, float eyeGap,
+      float cropCenterX, float cropCenterY, float cropSide,
+      int uprightWidth, int uprightHeight) {
+    if (uprightWidth < 1 || uprightHeight < 1) {
+      return new FaceCrop(cropCenterX, cropCenterY, cropSide);
+    }
+    float shortSide = Math.min(uprightWidth, uprightHeight);
+    float cropWidthFraction = cropSide * shortSide / uprightWidth;
+    float cropHeightFraction = cropSide * shortSide / uprightHeight;
+    // Map the eye midpoint from locked-crop coordinates into frame coordinates.
+    float eyeX = cropCenterX + (eyeMidX - 0.5f) * cropWidthFraction;
+    float eyeY = cropCenterY + (eyeMidY - 0.5f) * cropHeightFraction;
+    float side = clamp(eyeGap * cropSide * EYE_CROP_RATIO,
+        MIN_CROP_SIDE, MAX_CROP_SIDE);
+    float sideFractionY = side * shortSide / uprightHeight;
+    float centerY = eyeY + sideFractionY * EYE_CROP_OFFSET;
+    float halfX = side * shortSide / (2f * uprightWidth);
+    float halfY = side * shortSide / (2f * uprightHeight);
+    return new FaceCrop(
+        clamp(eyeX, halfX, 1f - halfX),
+        clamp(centerY, halfY, 1f - halfY),
+        side);
+  }
 
   /**
    * Builds a descriptor from an NV21 preview frame. The crop is taken from the
@@ -112,8 +210,11 @@ public final class FaceTemplate {
     float std = (float) Math.sqrt(Math.max(0.0, variance));
 
     float quality = Math.min(1f, std / 48f);
-    if (mean < 24.0 || mean > 236.0) {
-      quality *= 0.45f;
+    // Only truly unusable exposures are penalised. A face lit mainly by the
+    // screen can sit near 20/255 and is still perfectly matchable, so an
+    // earlier, stricter bound rejected good scans in dim rooms.
+    if (mean < 16.0 || mean > 240.0) {
+      quality *= 0.55f;
     }
     if (std < 5.0f) {
       quality = 0f;
