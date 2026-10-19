@@ -38,7 +38,8 @@ public final class FaceStore {
   private static final String[] LEGACY_PIN_PREFERENCES = {
       "pin_failures", "pin_blocked_until", "invalid_face_scans", "pin_removed_by_failures"
   };
-  private static final int MAX_FACE_FAILURES = 5;
+  /** Maximum number of consecutive failed scans allowed before a cooldown. */
+  public static final int MAX_FACE_FAILURES = 999;
   private static final long FACE_COOLDOWN_MS = 30000L;
   private static final String FORMAT_VERSION = "1";
   private static final Charset UTF8 = Charset.forName("UTF-8");
@@ -83,10 +84,10 @@ public final class FaceStore {
   }
 
   /**
-   * Face attempts are throttled: after five failed scans (timeouts, wrong
-   * faces, or suspected spoofs) the camera scan pauses for a cooldown.
-   * Persisted so force-stopping the app does not reset it. Walking away
-   * mid-scan does not count as a failure.
+   * Face attempts are throttled only at the maximum allowed limit: after 999
+   * consecutive failed scans (timeouts, wrong faces, or suspected spoofs) the
+   * camera scan pauses for a cooldown. Persisted so force-stopping the app
+   * does not reset it. Walking away mid-scan does not count as a failure.
    */
   public synchronized boolean isFaceBlocked() {
     long until = preferences.getLong(FACE_BLOCKED_UNTIL, 0L);
@@ -107,7 +108,10 @@ public final class FaceStore {
   /** Records one failed face attempt towards the short scan cooldown. */
   public synchronized void recordFaceFailure() {
     if (isFaceBlocked()) return;
-    int failures = preferences.getInt(FACE_FAILURES, 0) + 1;
+    // 999 is the hard maximum for the stored counter, so a stale or corrupt
+    // preference can never overflow it or push the count past the limit.
+    int previous = Math.max(0, preferences.getInt(FACE_FAILURES, 0));
+    int failures = previous >= MAX_FACE_FAILURES ? MAX_FACE_FAILURES : previous + 1;
     if (failures >= MAX_FACE_FAILURES) {
       preferences.edit()
           .putLong(FACE_BLOCKED_UNTIL, System.currentTimeMillis() + FACE_COOLDOWN_MS)
