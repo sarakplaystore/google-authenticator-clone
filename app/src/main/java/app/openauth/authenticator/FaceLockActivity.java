@@ -1793,8 +1793,14 @@ public final class FaceLockActivity extends Activity
     if (phase == LivenessSession.Phase.RETURN_CENTER) {
       stepView.setText("STEP " + Math.min(done + 1, total) + " OF " + total);
       captureProgress.setText(sessionDots(done, total));
-      setStatus("Nice — back to the center",
-          "Look straight at the camera. The next prompt starts once you are centered.");
+      if (session.getGuidance() == LivenessSession.Guidance.CENTER) {
+        setStatus("Turn back to the center",
+            "Bring your nose back toward the camera, then hold still for a moment.");
+      } else {
+        setStatus("Nice — hold still",
+            "Face the camera straight on for a moment so the next prompt starts "
+                + "from the same position.");
+      }
       return;
     }
     if (phase == LivenessSession.Phase.FINAL_CONFIRM) {

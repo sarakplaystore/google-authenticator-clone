@@ -72,6 +72,8 @@ public final class LivenessSession {
     HOLD,
     /** Eyes are closed during the blink prompt; open them now. */
     EYES_CLOSED,
+    /** The head is still off-centre between prompts; face the camera again. */
+    CENTER,
     /** The prompt timed out and is being repeated. */
     RETRY_CHALLENGE
   }
@@ -130,7 +132,7 @@ public final class LivenessSession {
 
   private static final long BASELINE_TIMEOUT_MS = 8000L;
   private static final long CHALLENGE_TIMEOUT_MS = 9000L;
-  private static final long RETURN_TIMEOUT_MS = 6000L;
+  private static final long RETURN_TIMEOUT_MS = 8000L;
   private static final long FINAL_TIMEOUT_MS = 7000L;
   // Long enough for three prompts plus a repeat of each. The per-prompt
   // timers, not this ceiling, are what actually bound the attempt.
@@ -650,6 +652,7 @@ public final class LivenessSession {
     }
     if (frame.simStraight < IDENTITY_FLOOR) {
       holdFrames = 0;
+      guidance = Guidance.CENTER;
       return;
     }
     float yaw = Math.abs(frame.signals.eyeMidX - baseEyeX);
@@ -664,6 +667,7 @@ public final class LivenessSession {
       }
     } else {
       holdFrames = 0;
+      guidance = Guidance.CENTER;
     }
   }
 
