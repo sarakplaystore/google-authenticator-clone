@@ -26,8 +26,6 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.SystemClock;
 import android.provider.Settings;
-import android.text.InputFilter;
-import android.text.InputType;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -39,7 +37,6 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowManager;
-import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -62,10 +59,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * times and checks the face responds to the light, and rejects frames with
  * the moiré grid of a replayed display. The platform
  * {@link android.media.FaceDetector} provides native face presence on top of
- * the app's own landmark geometry. Failed attempts are throttled like PIN
- * attempts. The same check guards every code reveal ({@link #MODE_REVEAL}).
- * A six-digit backup PIN is created during setup so a failed scan cannot
- * lock the user out permanently.</p>
+ * the app's own landmark geometry. Failed attempts pause scanning for a
+ * cooldown. The same check guards every code reveal ({@link #MODE_REVEAL}).
+ * A live face scan is the only way in: there is no PIN fallback.</p>
  *
  * <p>The layout is fully edge-to-edge and measured at runtime: the camera
  * preview is centre-cropped to the display (never stretched), the face guide
@@ -112,8 +108,6 @@ public final class FaceLockActivity extends Activity
   private static final float FACE_CROP_EYE_RATIO = 3.2f;
   /** Move the crop centre this far below the eye midpoint (fraction of its side). */
   private static final float FACE_CROP_EYE_OFFSET = 0.10f;
-  /** Number of failed scans left at which the UI warns about PIN removal. */
-  private static final int PIN_REMOVAL_WARNING = 5;
 
   private final Handler ui = new Handler();
   private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -612,20 +606,9 @@ public final class FaceLockActivity extends Activity
     if (enrolled.isEmpty()) {
       captureProgress.setText("");
       stepView.setText(revealMode ? "FACE CHECK" : "FACE UNLOCK");
-      boolean hasPin = faceStore.hasPin();
-      setStatus("Face data unavailable", hasPin
-          ? "Use your backup PIN to " + (revealMode ? "reveal" : "unlock") + "."
-          : "Close this screen and register your face again.");
-      View.OnClickListener cancel = new View.OnClickListener() {
-        @Override public void onClick(View view) { finishCanceled(); }
-      };
-      if (hasPin) {
-        showActions("Use backup PIN", new View.OnClickListener() {
-          @Override public void onClick(View view) { showPinUnlockDialog(); }
-        }, "Cancel", cancel, null, null);
-      } else {
-        showActions("Cancel", cancel, null, null, null, null);
-      }
+      setStatus("Face data unavailable",
+          "Close this screen and register your face again.");
+      showCancelAction();
       return;
     }
     stepView.setText(revealMode ? "LIVE FACE CHECK" : "FACE UNLOCK");
@@ -638,27 +621,19 @@ public final class FaceLockActivity extends Activity
                 + ". Follow the prompts — they change every time."
             : "Center your face inside the oval, then follow the prompts. "
                 + "They change every time so a photo can't be used.");
-    showPinOrCancelActions();
+    showCancelAction();
     overlay.setState(OverlayMode.ACTIVE, 0f, OverlayCue.NONE);
     ensureSession();
   }
 
   /**
-   * The fallback row honours the PIN policy: after the backup PIN has been
-   * removed (or for a legacy registration that never had one) there is no
-   * button that would only open a "No backup PIN" dialog.
+   * Face unlock is the only way in, so every fallback panel offers just a
+   * Cancel action. There is no PIN button that could not be honoured.
    */
-  private void showPinOrCancelActions() {
-    View.OnClickListener cancel = new View.OnClickListener() {
+  private void showCancelAction() {
+    showActions("Cancel", new View.OnClickListener() {
       @Override public void onClick(View view) { finishCanceled(); }
-    };
-    if (faceStore.hasPin()) {
-      showActions("Use backup PIN", new View.OnClickListener() {
-        @Override public void onClick(View view) { showPinUnlockDialog(); }
-      }, "Cancel", cancel, null, null);
-    } else {
-      showActions("Cancel", cancel, null, null, null, null);
-    }
+    }, null, null, null, null);
   }
 
   private void applyEnrollUi() {
@@ -694,7 +669,7 @@ public final class FaceLockActivity extends Activity
       showActions(null, null, null, null, "Skip", new View.OnClickListener() {
         @Override public void onClick(View view) {
           enrollStep = 4;
-          askForPinOrFinish();
+          saveCapturedFace();
         }
       });
       blinkBaseFrames = 0;
@@ -726,33 +701,14 @@ public final class FaceLockActivity extends Activity
     lastBlockedSecond = -1;
     stepView.setText(revealMode ? "FACE CHECK" : "FACE UNLOCK");
     captureProgress.setText("");
-    boolean pinRemoved = !faceStore.hasPin() && faceStore.wasPinRemovedByFailures();
-    setStatus(pinRemoved ? "Backup PIN removed" : "Face scan paused", blockedMessage());
-    showPinOrCancelActions();
+    setStatus("Face scan paused", blockedMessage());
+    showCancelAction();
     overlay.setState(OverlayMode.ERROR, 0f, OverlayCue.NONE);
   }
 
   private String blockedMessage() {
-    String cooldown = "Too many failed face attempts. Try again in "
-        + faceStore.faceCooldownSeconds() + " seconds";
-    if (faceStore.hasPin()) {
-      return cooldown + ", or use your backup PIN now."
-          + pinRemovalWarning();
-    }
-    if (faceStore.wasPinRemovedByFailures()) {
-      return cooldown + ". The backup PIN was removed after too many invalid scans, "
-          + "so face unlock is the only way back in.";
-    }
-    return cooldown + ".";
-  }
-
-  /** Warn before the backup PIN disappears, so the limit is never a surprise. */
-  private String pinRemovalWarning() {
-    if (!faceStore.hasPin()) return "";
-    int remaining = faceStore.scansUntilPinRemoval();
-    if (remaining <= 0 || remaining > PIN_REMOVAL_WARNING) return "";
-    return " " + remaining + (remaining == 1 ? " more failed scan will" : " more failed scans will")
-        + " remove the backup PIN.";
+    return "Too many failed face attempts. Try again in "
+        + faceStore.faceCooldownSeconds() + " seconds.";
   }
 
   private void tickBlockedCountdown() {
@@ -767,8 +723,7 @@ public final class FaceLockActivity extends Activity
     int seconds = faceStore.faceCooldownSeconds();
     if (seconds != lastBlockedSecond) {
       lastBlockedSecond = seconds;
-      boolean pinRemoved = !faceStore.hasPin() && faceStore.wasPinRemovedByFailures();
-      setStatus(pinRemoved ? "Backup PIN removed" : "Face scan paused", blockedMessage());
+      setStatus("Face scan paused", blockedMessage());
     }
   }
 
@@ -920,8 +875,8 @@ public final class FaceLockActivity extends Activity
   // ------------------------------------------------------- enrolment samples
 
   private void onEnrollFrame(FrameResult result) {
-    // Step 4 means the PIN step is already on screen; ignore further frames
-    // so a second blink cannot stack another dialog.
+    // Step 4 means the captures are complete and being saved; ignore further
+    // frames so a second blink cannot add another sample.
     if (finished || !cameraStarted || enrollStep >= 4) return;
     // Drop a frame that was measured with a crop that has since been replaced.
     if (result.cropGeneration != analysisCropGeneration) return;
@@ -1080,8 +1035,8 @@ public final class FaceLockActivity extends Activity
       enrollStep = 4;
       hapticConfirm();
       overlay.setState(OverlayMode.SUCCESS, 1f, OverlayCue.NONE);
-      setStatus("Face registered", "Now choose a backup PIN for the times a scan fails.");
-      askForPinOrFinish();
+      setStatus("Face registered", "Saving your face registration…");
+      saveCapturedFace();
     }
   }
 
@@ -1091,207 +1046,21 @@ public final class FaceLockActivity extends Activity
       // Never trap the user on the calibration step; unlock challenges adapt
       // to whichever signals are measurable for this person.
       enrollStep = 4;
-      askForPinOrFinish();
+      saveCapturedFace();
     }
   }
 
-  private void askForPinOrFinish() {
-    if (faceStore.hasPin()) {
-      try {
-        faceStore.saveTemplates(captured);
-        finishSuccess();
-      } catch (RuntimeException e) {
-        Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
-        showActions("Try again", new View.OnClickListener() {
-          @Override public void onClick(View view) { askForPinOrFinish(); }
-        }, null, null, null, null);
-        setStatus("Face could not be saved", "Tap Try again to store the captured face.");
-      }
-      return;
+  private void saveCapturedFace() {
+    try {
+      faceStore.saveTemplates(captured);
+      finishSuccess();
+    } catch (RuntimeException e) {
+      Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
+      showActions("Try again", new View.OnClickListener() {
+        @Override public void onClick(View view) { saveCapturedFace(); }
+      }, null, null, null, null);
+      setStatus("Face could not be saved", "Tap Try again to store the captured face.");
     }
-    showCreatePinDialog();
-  }
-
-  private void showCreatePinDialog() {
-    LinearLayout form = new LinearLayout(this);
-    form.setOrientation(LinearLayout.VERTICAL);
-    form.setPadding(dp(24), dp(4), dp(24), 0);
-    TextView explanation = text(
-        "Use this 6-digit PIN if face unlock fails. It is stored only on this device.",
-        13, Color.rgb(95, 99, 104), Typeface.NORMAL);
-    explanation.setLineSpacing(dp(2), 1f);
-    form.addView(explanation);
-    final EditText pin = pinField("PIN");
-    final EditText confirm = pinField("Confirm PIN");
-    LinearLayout.LayoutParams fieldParams = new LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT, dp(50));
-    fieldParams.topMargin = dp(14);
-    form.addView(pin, fieldParams);
-    LinearLayout.LayoutParams confirmParams = new LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT, dp(50));
-    confirmParams.topMargin = dp(8);
-    form.addView(confirm, confirmParams);
-
-    final AlertDialog dialog = new AlertDialog.Builder(this)
-        .setTitle("Set a backup PIN")
-        .setView(form)
-        .setNegativeButton("Retake", null)
-        .setPositiveButton("Save PIN", null)
-        .create();
-    dialog.setCanceledOnTouchOutside(false);
-    dialog.setCancelable(true);
-    dialog.setOnCancelListener(new DialogInterface.OnCancelListener() {
-      @Override public void onCancel(DialogInterface ignored) { retakeCaptures(); }
-    });
-    dialog.setOnShowListener(new DialogInterface.OnShowListener() {
-      @Override public void onShow(DialogInterface ignored) {
-        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(
-            new View.OnClickListener() {
-              @Override public void onClick(View view) {
-                dialog.dismiss();
-                retakeCaptures();
-              }
-            });
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(
-            new View.OnClickListener() {
-              @Override public void onClick(View view) {
-                String value = pin.getText().toString();
-                String problem = FaceStore.pinProblem(value);
-                if (problem != null) {
-                  pin.setError(problem);
-                  pin.requestFocus();
-                  return;
-                }
-                if (!value.equals(confirm.getText().toString())) {
-                  confirm.setError("The PINs do not match.");
-                  confirm.requestFocus();
-                  return;
-                }
-                try {
-                  faceStore.saveEnrollment(captured, value);
-                  dialog.dismiss();
-                  finishSuccess();
-                } catch (RuntimeException e) {
-                  Toast.makeText(FaceLockActivity.this, e.getMessage(),
-                      Toast.LENGTH_LONG).show();
-                }
-              }
-            });
-        pin.requestFocus();
-      }
-    });
-    dialog.show();
-  }
-
-  private EditText pinField(String hint) {
-    EditText input = new EditText(this);
-    input.setSingleLine(true);
-    input.setHint(hint);
-    input.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-    input.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
-    input.setFilters(new InputFilter[] {new InputFilter.LengthFilter(6)});
-    input.setPadding(dp(10), 0, dp(10), 0);
-    return input;
-  }
-
-  private void retakeCaptures() {
-    captured.clear();
-    enrollStep = 0;
-    enrollBaseSignals = null;
-    applyInitialUi();
-    setStatus("Let's try again",
-        "Capture three angles — straight, your left, your right — then blink.");
-  }
-
-  // ------------------------------------------------------------- PIN fallback
-
-  private void showPinUnlockDialog() {
-    if (faceStore.isPinBlocked()) {
-      Toast.makeText(this, "Too many attempts. Try again in "
-          + faceStore.pinCooldownSeconds() + " seconds.", Toast.LENGTH_LONG).show();
-      return;
-    }
-    if (!faceStore.hasPin()) {
-      new AlertDialog.Builder(this)
-          .setTitle("No backup PIN")
-          .setMessage(faceStore.wasPinRemovedByFailures()
-              ? "The backup PIN was removed after more than "
-                  + FaceStore.MAX_INVALID_SCANS + " invalid face scans. Unlock with "
-                  + "your face, then set a new PIN under Face unlock settings."
-              : "A backup PIN was not saved on this device. Unlock with your face, then "
-                  + "set a PIN under Face unlock settings.")
-          .setPositiveButton("OK", null)
-          .show();
-      return;
-    }
-    session = null;
-    releaseCamera();
-    final EditText input = pinField("6-digit PIN");
-    LinearLayout box = new LinearLayout(this);
-    box.setPadding(dp(24), dp(10), dp(24), 0);
-    box.addView(input, new LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT, dp(50)));
-    final AlertDialog dialog = new AlertDialog.Builder(this)
-        .setTitle("Enter backup PIN")
-        .setMessage(revealMode
-            ? "Use the PIN you chose when registering your face to reveal this code."
-            : "Use the PIN you chose when registering your face.")
-        .setView(box)
-        .setNegativeButton("Cancel", null)
-        .setPositiveButton(revealMode ? "Reveal" : "Unlock", null)
-        .create();
-    dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
-      @Override public void onDismiss(DialogInterface ignored) {
-        if (!finished && (revealMode || !FaceGate.unlocked)) {
-          applyInitialUi();
-          startCameraIfReady();
-        }
-      }
-    });
-    dialog.setOnShowListener(new DialogInterface.OnShowListener() {
-      @Override public void onShow(DialogInterface ignored) {
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(
-            new View.OnClickListener() {
-              @Override public void onClick(View view) {
-                if (faceStore.isPinBlocked()) {
-                  dialog.dismiss();
-                  Toast.makeText(FaceLockActivity.this, "Too many attempts. Try again in "
-                      + faceStore.pinCooldownSeconds() + " seconds.",
-                      Toast.LENGTH_LONG).show();
-                  return;
-                }
-                String value = input.getText().toString();
-                boolean accepted;
-                try {
-                  accepted = faceStore.verifyPin(value);
-                } catch (RuntimeException e) {
-                  Toast.makeText(FaceLockActivity.this, e.getMessage(),
-                      Toast.LENGTH_LONG).show();
-                  return;
-                }
-                if (accepted) {
-                  faceStore.clearPinFailures();
-                  finishSuccess();
-                  dialog.dismiss();
-                  return;
-                }
-                faceStore.recordPinFailure();
-                if (faceStore.isPinBlocked()) {
-                  dialog.dismiss();
-                  Toast.makeText(FaceLockActivity.this, "Too many attempts. Try again in "
-                      + faceStore.pinCooldownSeconds() + " seconds.",
-                      Toast.LENGTH_LONG).show();
-                  return;
-                }
-                input.setError("Incorrect PIN");
-                input.setText("");
-                input.requestFocus();
-              }
-            });
-        input.requestFocus();
-      }
-    });
-    dialog.show();
   }
 
   private void finishSuccess() {
@@ -1302,7 +1071,6 @@ public final class FaceLockActivity extends Activity
     if (!revealMode) {
       FaceGate.unlocked = true;
     }
-    faceStore.clearPinFailures();
     faceStore.clearFaceFailures();
     releaseCamera();
     restoreScreenLight();
@@ -1340,10 +1108,7 @@ public final class FaceLockActivity extends Activity
       }
     }, "Open app settings", new View.OnClickListener() {
       @Override public void onClick(View view) { openAppSettings(); }
-    }, !enrollMode && faceStore.hasPin() ? "Use backup PIN" : null,
-        new View.OnClickListener() {
-          @Override public void onClick(View view) { showPinUnlockDialog(); }
-        });
+    }, null, null);
   }
 
   private void openAppSettings() {
@@ -1364,9 +1129,7 @@ public final class FaceLockActivity extends Activity
     captureProgress.setText("");
     stepView.setText(enrollMode ? "CAMERA REQUIRED"
         : revealMode ? "FACE CHECK" : "FACE UNLOCK");
-    setStatus("Camera unavailable", detail
-        + (enrollMode || faceStore.hasPin() ? ""
-            : " There is no backup PIN on this device; a face scan is the only way in."));
+    setStatus("Camera unavailable", detail);
     View.OnClickListener retry = new View.OnClickListener() {
       @Override public void onClick(View view) { retryCamera(); }
     };
@@ -1375,10 +1138,6 @@ public final class FaceLockActivity extends Activity
     };
     if (enrollMode) {
       showActions("Try again", retry, "Close", close, null, null);
-    } else if (faceStore.hasPin()) {
-      showActions("Use backup PIN", new View.OnClickListener() {
-        @Override public void onClick(View view) { showPinUnlockDialog(); }
-      }, "Try camera again", retry, null, null);
     } else {
       showActions("Try camera again", retry, "Close", close, null, null);
     }
@@ -1605,8 +1364,8 @@ public final class FaceLockActivity extends Activity
   @Override public void onPreviewFrame(byte[] data, Camera source) {
     if (data == null || finished || camera == null || worker.isShutdown()) return;
     // Frames are analysed while waiting for a face too, so "show your face"
-    // can appear before a liveness session exists. A failure panel or a PIN
-    // dialog sets scanRequested false and stops the work.
+    // can appear before a liveness session exists. A failure panel sets
+    // scanRequested false and stops the work.
     if (!enrollMode && !scanRequested) return;
     long now = SystemClock.elapsedRealtime();
     if (now - lastFrameAt < FRAME_INTERVAL_MS) return;
@@ -2034,10 +1793,9 @@ public final class FaceLockActivity extends Activity
 
     session = null;
     scanRequested = false;
-    boolean pinRemoved = false;
     if (reason != LivenessSession.FailReason.FACE_LOST
         && reason != LivenessSession.FailReason.NONE) {
-      pinRemoved = faceStore.recordFaceFailure();
+      faceStore.recordFaceFailure();
     }
     hapticReject();
     overlay.setState(OverlayMode.ERROR, 0f, OverlayCue.NONE);
@@ -2045,18 +1803,12 @@ public final class FaceLockActivity extends Activity
       showFaceBlockedPanel();
       return;
     }
-    if (pinRemoved) {
-      showPinRemovedPanel();
-      return;
-    }
-    boolean hasPin = faceStore.hasPin();
     String status;
     String instruction;
     if (reason == LivenessSession.FailReason.WRONG_FACE) {
       status = "Face not recognized";
       instruction = "This doesn't match the enrolled face. Try even light without "
-          + "anything covering your face"
-          + (hasPin ? ", or use your backup PIN." : ", then try again.");
+          + "anything covering your face, then try again.";
     } else if (reason == LivenessSession.FailReason.SPOOF_SCREEN) {
       status = "That looked like a screen";
       instruction = "Use your real face in front of the camera — photos and videos "
@@ -2076,35 +1828,14 @@ public final class FaceLockActivity extends Activity
       instruction = "Follow each prompt as it appears. The order is different every time.";
     }
     captureProgress.setText("");
-    setStatus(status, instruction + pinRemovalWarning());
+    setStatus(status, instruction);
     View.OnClickListener cancel = new View.OnClickListener() {
       @Override public void onClick(View view) { finishCanceled(); }
     };
     View.OnClickListener retry = new View.OnClickListener() {
       @Override public void onClick(View view) { applyInitialUi(); }
     };
-    if (hasPin) {
-      showActions("Try again", retry, "Use backup PIN", new View.OnClickListener() {
-        @Override public void onClick(View view) { showPinUnlockDialog(); }
-      }, "Cancel", cancel);
-    } else {
-      showActions("Try again", retry, "Cancel", cancel, null, null);
-    }
-  }
-
-  private void showPinRemovedPanel() {
-    scanRequested = false;
-    stepView.setText(revealMode ? "FACE CHECK" : "FACE UNLOCK");
-    captureProgress.setText("");
-    setStatus("Backup PIN removed", "More than " + FaceStore.MAX_INVALID_SCANS
-        + " invalid face scans deleted the backup PIN. Unlock with your face; after "
-        + "unlocking you can set a new PIN under Face unlock settings.");
-    overlay.setState(OverlayMode.ERROR, 0f, OverlayCue.NONE);
-    showActions("Try again", new View.OnClickListener() {
-      @Override public void onClick(View view) { applyInitialUi(); }
-    }, "Cancel", new View.OnClickListener() {
-      @Override public void onClick(View view) { finishCanceled(); }
-    }, null, null);
+    showActions("Try again", retry, "Cancel", cancel, null, null);
   }
 
   // -------------------------------------------------------------- screen light
