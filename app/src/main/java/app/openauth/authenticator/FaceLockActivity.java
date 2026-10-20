@@ -1603,7 +1603,12 @@ public final class FaceLockActivity extends Activity
           break;
         }
       }
-      if (high - low < 24) {
+      // Only a (near-)flat frame gives up on the stretch. The old cutoff
+      // reset to 0..255 whenever the scene spanned less than 24 luma —
+      // exactly the deep-night case, where a screen-lit face may live in a
+      // 10-level band — so the detector was handed an almost black bitmap
+      // and its eye pair (which frames the whole scan) never appeared.
+      if (high - low < 4) {
         low = 0;
         high = 255;
       }
@@ -2057,7 +2062,12 @@ public final class FaceLockActivity extends Activity
     }
     boolean fill = !flash && fillLit;
     flashLit = flash;
-    float targetAlpha = flash ? 0.88f : fill ? 0.22f : 0f;
+    // In deep darkness the gentle fill is not enough light for the sensor
+    // to resolve an eye pair at all, so it burns brighter there; it costs
+    // nothing the flash check relies on, which compares flash-on frames
+    // against the (already fill-lit) baseline.
+    float targetAlpha = flash ? 0.88f
+        : fill ? (lastMeanLuma >= 0f && lastMeanLuma < 18f ? 0.40f : 0.22f) : 0f;
     if (Math.abs(flashView.getAlpha() - targetAlpha) > 0.01f) {
       flashView.setAlpha(targetAlpha);
     }

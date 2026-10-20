@@ -175,6 +175,19 @@ public final class LivenessVectors {
             + nightDarkResult.session.getFailReason());
     System.out.println("night no-response rejected: NO_LIGHT_RESPONSE");
 
+    // Deep night: the same owner lit only by the screen must still pass;
+    // this is the light level where the eyes used to vanish entirely.
+    Scenario deepNight = new Scenario(11);
+    deepNight.light = 0.12f;
+    deepNight.flashLift = 9;
+    Result deepResult = runScenario(deepNight);
+    require(deepResult.session.isPassed(),
+        "deep-night owner did not pass: " + deepResult.session.getPhase() + "/"
+            + deepResult.session.getFailReason() + " after " + deepResult.frames
+            + " frames, seq=" + deepResult.sequence);
+    System.out.println("deep-night owner passed in " + deepResult.frames
+        + " frames, challenges " + deepResult.sequence);
+
     // A photo is still just a photo at night.
     Scenario nightPhoto = new Scenario(10);
     nightPhoto.light = 0.38f;
@@ -233,6 +246,36 @@ public final class LivenessVectors {
     require(nightShut.eyeOpenness < 0.62f * nightSignals.eyeOpenness,
         "night blink dip too small: open=" + nightSignals.eyeOpenness
             + " closed=" + nightShut.eyeOpenness);
+
+    // Deep night: screen-lit only (mean luma in the low teens). The eye
+    // contrast is only a few luma levels, but it is still real structure;
+    // the landmark gates must scale with the contrast actually present
+    // instead of demanding daylight-sized absolute differences.
+    Pose deepNight = new Pose();
+    deepNight.light = 0.10f;
+    FaceSignals deepSignals = signals(deepNight);
+    require(deepSignals.eyesFound && deepSignals.mouthFound,
+        "deep-night landmarks not found (luma " + deepSignals.meanLuma + ")");
+    require(deepSignals.geometryLooksLikeFace(), "deep-night face failed geometry check");
+    Pose deepClosed = new Pose();
+    deepClosed.light = 0.10f;
+    deepClosed.closed = 1f;
+    FaceSignals deepShut = signals(deepClosed);
+    require(deepShut.eyesFound, "deep-night closed-eye frame lost the eyes");
+    require(deepShut.eyeOpenness < 0.62f * deepSignals.eyeOpenness,
+        "deep-night blink dip too small: open=" + deepSignals.eyeOpenness
+            + " closed=" + deepShut.eyeOpenness);
+
+    // Amplifying a dim crop must not invent eyes in a flat, noisy one:
+    // sensor noise alone has no paired eye/mouth geometry.
+    float[] noiseCrop = new float[FaceSignals.SIZE * FaceSignals.SIZE];
+    Random noiseRandom = new Random(42L);
+    for (int i = 0; i < noiseCrop.length; i++) {
+      noiseCrop[i] = 14f + noiseRandom.nextFloat() * 6f;
+    }
+    FaceSignals noiseSignals = FaceSignals.fromGray(noiseCrop);
+    require(noiseSignals != null && !noiseSignals.geometryLooksLikeFace(),
+        "a flat noisy crop was treated as a face");
 
     Pose left = new Pose();
     left.yaw = 1f;

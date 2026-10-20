@@ -48,10 +48,20 @@ public final class FaceSignals {
   private static final float CANONICAL_STD = 48f;
   /**
    * Amplification cap for nearly flat crops: dividing by a tiny std would
-   * turn sensor noise into fake structure. Below roughly this raw contrast
-   * there is nothing reliable to amplify.
+   * turn sensor noise into fake structure. It used to sit at 8, but a
+   * screen-lit face at night legitimately has a whole-crop std of 3–6, and
+   * the absolute landmark gates below then demanded more contrast than the
+   * scene contained — the eyes vanished even in a noise-free frame. The
+   * gates are now stated relative to the contrast actually achieved (see
+   * {@code contrastUnit}), so the cap only guards truly flat crops; the
+   * paired-eye geometry, mouth and descriptor quality checks still reject
+   * amplified noise.
    */
-  private static final float MIN_RAW_STD = 8f;
+  private static final float MIN_RAW_STD = 3f;
+  /** Eye centre-surround contrast gate at full canonical contrast. */
+  private static final float EYE_MIN_CONTRAST = 15f;
+  /** Contrast at which an eye counts as fully open, canonical units. */
+  private static final float EYE_OPEN_CONTRAST = 52f;
 
   // Landmark search windows in 96×96 crop coordinates. They are deliberately
   // generous: the face may sit nearer or further from the camera, which moves
@@ -155,9 +165,17 @@ public final class FaceSignals {
       float value = (gray[i] - mean) * scale;
       norm[i] = Math.max(-3f * CANONICAL_STD, Math.min(3f * CANONICAL_STD, value));
     }
+    // Contrast actually achieved after the (capped) amplification, as a
+    // fraction of canonical. The eye gate and openness scale are stated in
+    // these units: a dim crop whose std could only be lifted part-way must
+    // not be held to daylight-sized absolute differences, or its eyes are
+    // rejected no matter how clean the frame is. The floor keeps a
+    // near-flat crop from collapsing the gate to nothing.
+    float contrastUnit = Math.max(0.35f,
+        Math.min(1f, std * scale / CANONICAL_STD));
 
-    Blob leftEye = findEye(norm, EYE_L_X0, EYE_L_X1, EYE_Y0, EYE_Y1);
-    Blob rightEye = findEye(norm, EYE_R_X0, EYE_R_X1, EYE_Y0, EYE_Y1);
+    Blob leftEye = findEye(norm, EYE_L_X0, EYE_L_X1, EYE_Y0, EYE_Y1, contrastUnit);
+    Blob rightEye = findEye(norm, EYE_R_X0, EYE_R_X1, EYE_Y0, EYE_Y1, contrastUnit);
     boolean eyes = leftEye != null && rightEye != null
         && Math.abs(leftEye.y - rightEye.y) <= 8f;
     float gap = eyes ? rightEye.x - leftEye.x : -1f;
@@ -209,7 +227,8 @@ public final class FaceSignals {
   private static final int EYE_RING_HALF_X = 9;
   private static final int EYE_RING_HALF_Y = 8;
 
-  private static Blob findEye(float[] gray, int x0, int x1, int y0, int y1) {
+  private static Blob findEye(float[] gray, int x0, int x1, int y0, int y1,
+      float contrastUnit) {
     float bestScore = 0f;
     float bestContrast = 0f;
     int bestX = -1;
@@ -259,7 +278,7 @@ public final class FaceSignals {
         }
       }
     }
-    if (bestX < 0 || bestContrast < 15f) return null;
+    if (bestX < 0 || bestContrast < EYE_MIN_CONTRAST * contrastUnit) return null;
 
     // Refine to the darkness-weighted centroid inside the winning box and
     // measure the blob's vertical thickness.
@@ -307,15 +326,28 @@ public final class FaceSignals {
       }
       float thickness = (float) Math.sqrt(yVariance);
       blob.openness = clamp01(
-          0.70f * clamp01(bestContrast / 52f)
+          0.70f * contrastTerm(bestContrast, contrastUnit)
               + 0.30f * clamp01((thickness - 0.4f) / 1.7f));
     } else {
       blob.x = bestX;
       blob.y = bestY;
-      blob.openness = clamp01(bestContrast / 52f);
+      blob.openness = contrastTerm(bestContrast, contrastUnit);
     }
     blob.darkPixels = Math.max(dark, 10);
     return blob;
+  }
+
+  /**
+   * Eye contrast as an openness term. Squared on purpose: an open eye and
+   * a closed lash line both saturate a linear term (their measured
+   * centre-surround contrasts are ~65 vs ~27 canonical units, i.e. 1.0 vs
+   * 0.52 after clamping), so the blink dip stalled at ~0.62 of baseline —
+   * short of the dip the session looks for. Squaring keeps a wide-open
+   * eye at 1.0 while a closed one falls to ~0.27, at any light level.
+   */
+  private static float contrastTerm(float contrast, float contrastUnit) {
+    float term = clamp01(contrast / (EYE_OPEN_CONTRAST * contrastUnit));
+    return term * term;
   }
 
   /** A localised dark feature blob with its openness estimate. */
