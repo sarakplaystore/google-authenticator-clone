@@ -188,10 +188,9 @@ public final class FaceLockActivity extends Activity
 
   // Enrolment auto-capture state.
   private int enrollStep;
-  private int enrollHoldFrames;
+  private final EnrollAutoCapture enrollAutoCapture = new EnrollAutoCapture();
   private long enrollStepStartedAtMs;
   private FaceSignals enrollBaseSignals;
-  private boolean manualCaptureRequested;
   private int blinkBaseFrames;
   private float blinkBaseOpennessSum;
   private float blinkBaseOpenness = -1f;
@@ -655,30 +654,28 @@ public final class FaceLockActivity extends Activity
 
   private void applyEnrollUi() {
     titleView.setText("Register your face");
-    enrollHoldFrames = 0;
-    manualCaptureRequested = false;
+    enrollAutoCapture.reset();
+    overlay.setHoldProgress(0f);
     enrollStepStartedAtMs = SystemClock.elapsedRealtime();
     captureProgress.setText(enrollDots());
     stepView.setText("STEP " + Math.min(4, enrollStep + 1) + " OF 4");
     overlay.setState(OverlayMode.ACTIVE, captured.size() / 3f, enrollCue());
+    overlay.setHoldProgress(0f);
     if (enrollStep == 0) {
       setStatus("Look straight ahead",
-          "Center your face inside the oval in even light. It captures automatically.");
-      showActions(null, null, null, null, "Capture now", new View.OnClickListener() {
-        @Override public void onClick(View view) { manualCaptureRequested = true; }
-      });
+          "Center your face inside the oval in even light. Hold still — it "
+              + "captures by itself when the green ring fills. No need to tap.");
+      showActions(null, null, null, null, null, null);
     } else if (enrollStep == 1) {
       setStatus("Turn slowly to your left",
-          "Turn until it captures — this angle is used later to prove a live head turn.");
-      showActions(null, null, null, null, "Capture now", new View.OnClickListener() {
-        @Override public void onClick(View view) { manualCaptureRequested = true; }
-      });
+          "Turn, then hold — it captures by itself when the green ring fills. "
+              + "This angle is used later to prove a live head turn.");
+      showActions(null, null, null, null, null, null);
     } else if (enrollStep == 2) {
       setStatus("Turn slowly to your right",
-          "Turn the other way until it captures.");
-      showActions(null, null, null, null, "Capture now", new View.OnClickListener() {
-        @Override public void onClick(View view) { manualCaptureRequested = true; }
-      });
+          "Turn the other way, then hold — it captures by itself when the "
+              + "green ring fills.");
+      showActions(null, null, null, null, null, null);
     } else {
       setStatus("Now blink",
           "Look straight, then blink slowly once. This teaches the check what "
@@ -922,13 +919,26 @@ public final class FaceLockActivity extends Activity
       overlay.setState(OverlayMode.ACTIVE, captured.size() / 3f, enrollCue());
     }
     if (result.template == null || !result.template.isUsable() || result.signals == null) {
-      enrollHoldFrames = 0;
+      // An unusable frame pauses the auto-capture hold; it only resets
+      // after the grace period, so one bad frame costs nothing.
+      enrollAutoCapture.onFrame(false, result.tMs);
+      overlay.setHoldProgress(enrollAutoCapture.progress(result.tMs));
       setStatus("Move to better light",
           "Keep your whole face inside the oval. Avoid strong light behind you.");
       return;
     }
-    if (!result.facePresent) {
-      enrollHoldFrames = 0;
+    if (enrollStep >= 3) {
+      onEnrollBlinkFrame(result);
+      return;
+    }
+    boolean poseReady = enrollPoseReady(result.signals);
+    // The turned samples must not be gated on frontal face presence: the
+    // presence geometry is a straight-on check, and gating on it stranded
+    // the turn steps even while the pose landmarks were tracking fine.
+    // A ready turn pose (eyes + mouth + parallax) is its own evidence.
+    if (!result.facePresent && !(enrollStep > 0 && poseReady)) {
+      enrollAutoCapture.onFrame(false, result.tMs);
+      overlay.setHoldProgress(enrollAutoCapture.progress(result.tMs));
       if (faceAskShown) {
         showFaceAsk();
       } else {
@@ -936,24 +946,14 @@ public final class FaceLockActivity extends Activity
       }
       return;
     }
-    if (enrollStep >= 3) {
-      onEnrollBlinkFrame(result);
-      return;
-    }
-    if (manualCaptureRequested) {
-      manualCaptureRequested = false;
+    if (enrollAutoCapture.onFrame(poseReady, result.tMs)) {
+      overlay.setHoldProgress(0f);
       tryEnrollCapture(result);
-      return;
-    }
-    if (enrollPoseReady(result.signals)) {
-      if (++enrollHoldFrames >= 4) {
-        enrollHoldFrames = 0;
-        tryEnrollCapture(result);
-      } else {
-        setStatus("Hold it there…", "Capturing this angle.");
-      }
+    } else if (poseReady) {
+      overlay.setHoldProgress(enrollAutoCapture.progress(result.tMs));
+      setStatus("Hold it there…", "Keep holding — capturing automatically.");
     } else {
-      enrollHoldFrames = 0;
+      overlay.setHoldProgress(enrollAutoCapture.progress(result.tMs));
       applyEnrollHint();
     }
   }

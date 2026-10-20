@@ -10,7 +10,7 @@ An independent, offline-first Android authenticator for standard time-based one-
 - Copying a code also requires a face check, so a hidden code cannot be read from the clipboard.
 - Automatically refresh codes and show the remaining time.
 - Search, rename, remove, and copy account codes.
-- Require a custom, on-device face registration before the account list is shown. Setup auto-captures three guided angles (straight, your left, your right) plus a blink; a live face scan is the only way to unlock the app.
+- Require a custom, on-device face registration before the account list is shown. Setup auto-captures three guided angles (straight, your left, your right) plus a blink — no shutter tap: hold each pose and the sample is taken when the green ring fills (a blinked or dropped frame pauses the hold instead of restarting it); a live face scan is the only way to unlock the app.
 - Unlock with a live face check on every app open: three prompts (blink, turn left/right, nod) in a random order that changes every attempt, performed by the enrolled face — a photo or a replayed video cannot follow them. Each prompt is spelled out on screen with a live “hold it” ring and a hint when you turn the wrong way; a missed prompt is repeated once instead of ending the attempt. The app does **not** use Android's biometric prompt, fingerprint sensors, Touch ID, or the device's built-in face unlock, and it does not request biometric permissions.
 - Work at night: the face check measures contrast relative to the scene instead of raw brightness, so a face lit mostly by the screen still keeps its landmarks, clears the match-quality gate, and matches a daylight enrolment; the eye gates scale with the contrast actually present (a screen-lit face in the low teens of luma used to fall below daylight-sized absolute thresholds and lose its eyes entirely, even in a noise-free frame), the platform detector's contrast stretch stays on in deep darkness instead of standing down, and a fill light — brighter when the room is darkest — steadies a dark room without strobing, while every anti-spoof check (live light response, screen moiré, 3D parallax) stays armed in the dark.
 - Fit any phone screen: the camera preview is full-screen edge-to-edge and centre-cropped (never stretched), the face guide is laid out in the measured free space, and notch/gesture-bar insets are honoured on every Android version.
@@ -204,15 +204,17 @@ these exist so that the checked-in artifact can be built, aligned, signed and
 verified with nothing but Python.
 
 
-The dependency-free RFC 6238 regression vectors are in `tests/TotpVectors.java`, the custom face descriptor checks (including the eye-aligned crop and its impostor separation) are in `tests/FaceTemplateVectors.java`, and the anti-spoofing session checks (a synthetic face driven through the randomised prompts, coaching hints, a wrong-way recovery, a missed-prompt retry, plus static-photo, rigid-photo, screen-replay, impostor, and no-light-response attacks) are in `tests/LivenessVectors.java`. After running `./build.sh`, run them with a JDK using the compiled app classes on the classpath:
+The dependency-free RFC 6238 regression vectors are in `tests/TotpVectors.java`, the custom face descriptor checks (including the eye-aligned crop and its impostor separation) are in `tests/FaceTemplateVectors.java`, the anti-spoofing session checks (a synthetic face driven through the randomised prompts, coaching hints, a wrong-way recovery, a missed-prompt retry, plus static-photo, rigid-photo, screen-replay, impostor, and no-light-response attacks) are in `tests/LivenessVectors.java`, and the enrolment auto-capture timing checks (held pose, passing glance, a dropped frame mid-hold, a long pose loss) are in `tests/EnrollAutoCaptureVectors.java`. After running `./build.sh`, run them with a JDK using the compiled app classes on the classpath:
 
 ```sh
 mkdir -p build/test-classes
 javac -cp build/manual/classes -d build/test-classes \
-  tests/TotpVectors.java tests/FaceTemplateVectors.java tests/LivenessVectors.java
+  tests/TotpVectors.java tests/FaceTemplateVectors.java tests/LivenessVectors.java \
+  tests/EnrollAutoCaptureVectors.java
 java -cp build/manual/classes:build/test-classes TotpVectors
 java -cp build/manual/classes:build/test-classes FaceTemplateVectors
 java -cp build/manual/classes:build/test-classes LivenessVectors
+java -cp build/manual/classes:build/test-classes EnrollAutoCaptureVectors
 ```
 
 With no JDK, use the JRE and Eclipse compiler from `tools/fetch_toolchain.sh`:
@@ -222,10 +224,11 @@ JAVA=build/toolchain/jdk4py/jdk4py/java-runtime/bin/java
 $JAVA -cp build/toolchain/ecj.jar org.eclipse.jdt.internal.compiler.batch.Main \
   -source 8 -target 8 -classpath build/manual/classes \
   -d build/test-classes tests/TotpVectors.java tests/FaceTemplateVectors.java \
-  tests/LivenessVectors.java
+  tests/LivenessVectors.java tests/EnrollAutoCaptureVectors.java
 $JAVA -cp build/manual/classes:build/test-classes TotpVectors
 $JAVA -cp build/manual/classes:build/test-classes FaceTemplateVectors
 $JAVA -cp build/manual/classes:build/test-classes LivenessVectors
+$JAVA -cp build/manual/classes:build/test-classes EnrollAutoCaptureVectors
 ```
 
 ## Credits and technology used
